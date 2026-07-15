@@ -8,12 +8,29 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include "FS.h"
+#include "SD_MMC.h"
+#include "time.h"
 
 // ===================
 // WiFi credentials
 // ===================
-const char* WIFI_SSID = "YOUR_SSID";
-const char* WIFI_PASS = "YOUR_PASSWORD";
+const char* WIFI_SSID = "POCO C40";
+const char* WIFI_PASS = "dannyayo";
+
+// ===================
+// NTP / timezone (Lagos = UTC+1, no DST)
+// ===================
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+// ===================
+// Snapshot timing
+// ===================
+const unsigned long SNAPSHOT_INTERVAL_MS = 30000; // every 30s for now — swap for PIR trigger later
+unsigned long lastSnapshotMs = 0;
+bool sdCardReady = false;
 
 // ===================
 // AI-Thinker pin map
@@ -103,6 +120,41 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
 
+  // Sync time before we save anything — filenames depend on it
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.print("Syncing time");
+  struct tm timeinfo;
+  int ntpAttempts = 0;
+  while (!getLocalTime(&timeinfo) && ntpAttempts < 20) {
+    delay(500);
+    Serial.print(".");
+    ntpAttempts++;
+  }
+  Serial.println("");
+  if (ntpAttempts >= 20) {
+    Serial.println("NTP sync failed — snapshot filenames will use millis() instead");
+  } else {
+    Serial.println("Time synced");
+  }
+
+  // AI-Thinker shares SD data lines with camera pins — 1-bit mode avoids the conflict
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("SD card mount failed — snapshots disabled, streaming will still work");
+    sdCardReady = false;
+  } else {
+    uint8_t cardType = SD_MMC.cardType();
+    if (cardType == CARD_NONE) {
+      Serial.println("No SD card detected");
+      sdCardReady = false;
+    } else {
+      Serial.printf("SD card mounted, %lluMB\n", SD_MMC.cardSize() / (1024 * 1024));
+      if (!SD_MMC.exists("/snapshots")) {
+        SD_MMC.mkdir("/snapshots");
+      }
+      sdCardReady = true;
+    }
+  }
+
   startCameraServer();
 
   Serial.print("Camera ready. Stream at: http://");
@@ -110,6 +162,47 @@ void setup() {
   Serial.println("/stream");
 }
 
+void saveSnapshot() {
+  if (!sdCardReady) return;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Snapshot capture failed");
+    return;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("Snapshot skipped — non-JPEG frame");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  // Build timestamped filename; falls back to millis() if NTP never synced
+  char filename[64];
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 100)) {
+    strftime(filename, sizeof(filename), "/snapshots/%Y%m%d_%H%M%S.jpg", &timeinfo);
+  } else {
+    snprintf(filename, sizeof(filename), "/snapshots/snap_%lu.jpg", millis());
+  }
+
+  File file = SD_MMC.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.printf("Failed to open %s for writing\n", filename);
+    esp_camera_fb_return(fb);
+    return;
+  }
+  file.write(fb->buf, fb->len);
+  file.close();
+  esp_camera_fb_return(fb);
+
+  Serial.printf("Saved snapshot: %s (%u bytes)\n", filename, fb->len);
+}
+
 void loop() {
-  delay(10000); // server runs on its own task; nothing needed here yet
+  unsigned long now = millis();
+  if (now - lastSnapshotMs >= SNAPSHOT_INTERVAL_MS) {
+    lastSnapshotMs = now;
+    saveSnapshot();
+  }
+  delay(100); // keep loop() light so it doesn't starve the streaming task
 }
