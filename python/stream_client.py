@@ -1,16 +1,27 @@
 """
-Step 4: pull frames from the ESP32-CAM's existing /stream endpoint.
-No firmware changes needed — the camera already serves MJPEG, this just
-parses the multipart stream into individual frames we can process.
+Step 4/5: pull frames from the ESP32-CAM's /stream endpoint and run
+face detection on each frame using OpenCV's Haar cascade classifier.
 
-Face detection (step 5) hooks into the frame loop below.
+Ships inside opencv-python already — no extra install, no version drama.
+Detected faces are boxed on-screen and cropped to disk under detected_faces/
+for use in the recognition step next.
 """
+
+import os
+import time
 
 import cv2
 import numpy as np
 import requests
 
 STREAM_URL = "http://10.76.39.104/stream"  # replace with your device's IP
+FACE_SAVE_DIR = "detected_faces"
+SAVE_COOLDOWN_SEC = 2.0  # avoid saving 30 near-identical crops per second
+
+# Ships inside every opencv-python install under cv2.data.haarcascades
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 
 def frame_generator(url: str):
@@ -33,12 +44,34 @@ def frame_generator(url: str):
 
 
 def main():
+    os.makedirs(FACE_SAVE_DIR, exist_ok=True)
+    last_save_time = 0.0
+
     print(f"Connecting to {STREAM_URL} ...")
     try:
         for frame in frame_generator(STREAM_URL):
-            # Step 5 will slot face detection in right here, per frame.
-            cv2.imshow("ESP32-CAM", frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,      # how much the image is scaled down at each step
+                minNeighbors=5,       # higher = fewer false positives, may miss angled faces
+                minSize=(60, 60),     # ignore tiny/far-away detections
+            )
 
+            now = time.time()
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                if now - last_save_time >= SAVE_COOLDOWN_SEC:
+                    face_crop = frame[y:y + h, x:x + w]
+                    filename = os.path.join(
+                        FACE_SAVE_DIR, f"face_{int(now * 1000)}.jpg"
+                    )
+                    cv2.imwrite(filename, face_crop)
+                    last_save_time = now
+                    print(f"Saved face crop: {filename}")
+
+            cv2.imshow("ESP32-CAM", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     except requests.exceptions.RequestException as e:
@@ -50,3 +83,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
