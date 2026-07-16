@@ -5,7 +5,7 @@
  * Confirms camera init + WiFi + streaming work before adding SD/PIR/face logic.
  * View stream at: http://<device-ip>/stream
  */
-
+o
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "FS.h"

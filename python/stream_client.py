@@ -1,8 +1,8 @@
 """
 Step 4/5: pull frames from the ESP32-CAM's /stream endpoint and run
-face detection on each frame using OpenCV's Haar cascade classifier.
+face detection on each frame using MediaPipe (pinned to 0.10.9 — later
+releases dropped the legacy `solutions` API in favor of the Tasks API).
 
-Ships inside opencv-python already — no extra install, no version drama.
 Detected faces are boxed on-screen and cropped to disk under detected_faces/
 for use in the recognition step next.
 """
@@ -11,17 +11,16 @@ import os
 import time
 
 import cv2
+import mediapipe as mp
 import numpy as np
 import requests
 
-STREAM_URL = "http://10.76.39.104/stream"  # replace with your device's IP
+STREAM_URL = "http://10.76.39.104/stream" # replace with your device's IP
 FACE_SAVE_DIR = "detected_faces"
 SAVE_COOLDOWN_SEC = 2.0  # avoid saving 30 near-identical crops per second
+CROP_PADDING = 0.5  # expand crop by 30% on each side to capture full face incl. chin/forehead
 
-# Ships inside every opencv-python install under cv2.data.haarcascades
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+mp_face_detection = mp.solutions.face_detection
 
 
 def frame_generator(url: str):
@@ -49,31 +48,52 @@ def main():
 
     print(f"Connecting to {STREAM_URL} ...")
     try:
-        for frame in frame_generator(STREAM_URL):
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,      # how much the image is scaled down at each step
-                minNeighbors=5,       # higher = fewer false positives, may miss angled faces
-                minSize=(60, 60),     # ignore tiny/far-away detections
-            )
+        with mp_face_detection.FaceDetection(
+            model_selection=0,        # 0 = short-range model, best for faces within ~2m (fits indoor security use)
+            min_detection_confidence=0.6,
+        ) as detector:
+            for frame in frame_generator(STREAM_URL):
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = detector.process(rgb_frame)
 
-            now = time.time()
-            for (x, y, w, h) in faces:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                h, w = frame.shape[:2]
 
-                if now - last_save_time >= SAVE_COOLDOWN_SEC:
-                    face_crop = frame[y:y + h, x:x + w]
-                    filename = os.path.join(
-                        FACE_SAVE_DIR, f"face_{int(now * 1000)}.jpg"
-                    )
-                    cv2.imwrite(filename, face_crop)
-                    last_save_time = now
-                    print(f"Saved face crop: {filename}")
+                if results.detections:
+                    for detection in results.detections:
+                        box = detection.location_data.relative_bounding_box
+                        x1 = max(int(box.xmin * w), 0)
+                        y1 = max(int(box.ymin * h), 0)
+                        bw = int(box.width * w)
+                        bh = int(box.height * h)
+                        x2, y2 = min(x1 + bw, w), min(y1 + bh, h)
 
-            cv2.imshow("ESP32-CAM", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        confidence = detection.score[0]
+                        cv2.putText(frame, f"{confidence:.2f}", (x1, y1 - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                        now = time.time()
+                        if now - last_save_time >= SAVE_COOLDOWN_SEC and x2 > x1 and y2 > y1:
+                            # Pad the crop region outward so we capture the full face,
+                            # not just the tight detection box (which clips chin/forehead)
+                            pad_x = int(bw * CROP_PADDING)
+                            pad_y = int(bh * CROP_PADDING)
+                            cx1 = max(x1 - pad_x, 0)
+                            cy1 = max(y1 - pad_y, 0)
+                            cx2 = min(x2 + pad_x, w)
+                            cy2 = min(y2 + pad_y, h)
+
+                            face_crop = frame[cy1:cy2, cx1:cx2]
+                            filename = os.path.join(
+                                FACE_SAVE_DIR, f"face_{int(now * 1000)}.jpg"
+                            )
+                            cv2.imwrite(filename, face_crop)
+                            last_save_time = now
+                            print(f"Saved face crop: {filename}")
+
+                cv2.imshow("ESP32-CAM", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     except requests.exceptions.RequestException as e:
         print(f"Could not connect to stream: {e}")
         print("Check STREAM_URL and that the ESP32 is powered on and connected.")
