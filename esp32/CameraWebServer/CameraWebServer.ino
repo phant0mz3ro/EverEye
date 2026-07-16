@@ -28,7 +28,7 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // ===================
 // Snapshot timing
 // ===================
-const unsigned long SNAPSHOT_INTERVAL_MS = 30000; // every 30s for now — swap for PIR trigger later
+const unsigned long SNAPSHOT_INTERVAL_MS = 60000; // every 30s for now — swap for PIR trigger later
 unsigned long lastSnapshotMs = 0;
 bool sdCardReady = false;
 

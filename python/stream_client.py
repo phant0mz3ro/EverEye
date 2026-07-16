@@ -18,7 +18,10 @@ import requests
 STREAM_URL = "http://10.76.39.104/stream" # replace with your device's IP
 FACE_SAVE_DIR = "detected_faces"
 SAVE_COOLDOWN_SEC = 2.0  # avoid saving 30 near-identical crops per second
-CROP_PADDING = 0.5  # expand crop by 30% on each side to capture full face incl. chin/forehead
+CROP_PADDING = 0.3  # expand crop by 30% on each side to capture full face incl. chin/forehead
+
+MOTION_THRESHOLD = 25       # pixel intensity diff to count as "changed"
+MOTION_MIN_AREA = 2000      # min contour area (px) to count as real motion, filters noise
 
 mp_face_detection = mp.solutions.face_detection
 
@@ -42,9 +45,19 @@ def frame_generator(url: str):
                 yield frame
 
 
+def detect_motion(prev_gray, curr_gray):
+    """Returns True if enough pixels changed between frames to count as motion."""
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+    thresh = cv2.dilate(thresh, None, iterations=2)  # close small gaps in the diff blob
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return any(cv2.contourArea(c) >= MOTION_MIN_AREA for c in contours)
+
+
 def main():
     os.makedirs(FACE_SAVE_DIR, exist_ok=True)
     last_save_time = 0.0
+    prev_gray = None
 
     print(f"Connecting to {STREAM_URL} ...")
     try:
@@ -53,6 +66,20 @@ def main():
             min_detection_confidence=0.6,
         ) as detector:
             for frame in frame_generator(STREAM_URL):
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)  # smooths sensor noise so it isn't flagged as motion
+
+                motion = False
+                if prev_gray is not None:
+                    motion = detect_motion(prev_gray, gray_blurred)
+                prev_gray = gray_blurred
+
+                if not motion:
+                    cv2.imshow("ESP32-CAM", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue  # skip face detection entirely on static frames — this is the compute saved
+
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = detector.process(rgb_frame)
 
