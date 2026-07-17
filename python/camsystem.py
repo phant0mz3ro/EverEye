@@ -1,15 +1,18 @@
 """
-Pull frames from the ESP32-CAM's /stream endpoint, run motion-gated face
-detection (MediaPipe) + recognition (face_recognition), and show live
-boxes: green = known match, red = unknown.
+Multi-camera version: one process per camera, each running the full
+detect -> recognize -> display -> click pipeline independently.
 
-Click any box to open a details popup:
-  - Known person: shows their enrolled reference photo, name, and an
-    editable notes field (saved to profiles.json).
-  - Unknown person: lets you type a name and enroll them on the spot.
+Known faces / profiles are shared across all camera processes via
+multiprocessing.Manager, so enrolling someone on one camera makes them
+recognizable on every other camera immediately (not just after restart).
+
+Each camera gets its own OpenCV window and its own hidden Tk root
+(GUI state can't be shared across processes, so this is per-process
+by necessity — it's fine, each camera's popups are independent anyway).
 """
 
 import json
+import multiprocessing
 import os
 import pickle
 import time
@@ -22,7 +25,15 @@ import numpy as np
 import requests
 from PIL import Image, ImageTk
 
-STREAM_URL = "http://10.160.66.104/stream"  # replace with your device's IP
+# ===================
+# Camera list — "type": "http" for ESP32-CAM streams, "usb" for local webcams
+# For usb cameras, "source" is the device index (0, 1, ...) not a URL
+# ===================
+CAMERAS = [
+    {"name": "front_door", "type": "http", "source": "http://10.235.220.104/stream"},
+    {"name": "usb_test",   "type": "usb",  "source": 2},
+]
+
 FACE_SAVE_DIR = "detected_faces"
 KNOWN_FACES_DIR = "known_faces"
 SAVE_COOLDOWN_SEC = 2.0
@@ -35,43 +46,39 @@ ENCODINGS_FILE = "encodings.pkl"
 PROFILES_FILE = "profiles.json"
 RECOGNITION_TOLERANCE = 0.6
 
-BOX_PERSIST_SEC = 4.0  # how long a box stays visible/clickable after last detection
-
-mp_face_detection = mp.solutions.face_detection
+BOX_PERSIST_SEC = 4.0
 
 
-# ---------- persistence helpers ----------
+# ---------- disk persistence (used at startup + on every write-back) ----------
 
-def load_known_faces():
+def load_known_faces_from_disk():
     if not os.path.exists(ENCODINGS_FILE):
-        print(f"No {ENCODINGS_FILE} found — run encode_known_faces.py first. "
-              f"Continuing with everyone labeled 'Unknown'.")
+        print(f"No {ENCODINGS_FILE} found — run encode_known_faces.py first.")
         return [], []
     with open(ENCODINGS_FILE, "rb") as f:
         data = pickle.load(f)
-    print(f"Loaded {len(data['encodings'])} known face encodings")
     return data["encodings"], data["names"]
 
 
-def save_known_faces(known_encodings, known_names):
+def save_known_faces_to_disk(known_encodings, known_names):
+    # Convert Manager proxies to plain list/str before pickling
     with open(ENCODINGS_FILE, "wb") as f:
-        pickle.dump({"encodings": known_encodings, "names": known_names}, f)
+        pickle.dump({"encodings": list(known_encodings), "names": list(known_names)}, f)
 
 
-def load_profiles():
+def load_profiles_from_disk():
     if not os.path.exists(PROFILES_FILE):
         return {}
     with open(PROFILES_FILE, "r") as f:
         return json.load(f)
 
 
-def save_profiles(profiles):
+def save_profiles_to_disk(profiles):
     with open(PROFILES_FILE, "w") as f:
-        json.dump(profiles, f, indent=2)
+        json.dump(dict(profiles), f, indent=2)
 
 
 def get_reference_photo(name):
-    """Path to the first enrolled photo for a known person, or None."""
     person_dir = os.path.join(KNOWN_FACES_DIR, name)
     if not os.path.isdir(person_dir):
         return None
@@ -80,7 +87,7 @@ def get_reference_photo(name):
     return None
 
 
-# ---------- stream + motion ----------
+# ---------- stream + motion (identical to single-camera version) ----------
 
 def frame_generator(url: str):
     stream = requests.get(url, stream=True, timeout=10)
@@ -97,6 +104,21 @@ def frame_generator(url: str):
                 yield frame
 
 
+def usb_frame_generator(device_index: int):
+    cap = cv2.VideoCapture(device_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open USB camera at index {device_index}")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print(f"USB camera {device_index} read failed — stopping")
+                break
+            yield frame
+    finally:
+        cap.release()
+
+
 def detect_motion(prev_gray, curr_gray):
     diff = cv2.absdiff(prev_gray, curr_gray)
     _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
@@ -105,9 +127,9 @@ def detect_motion(prev_gray, curr_gray):
     return any(cv2.contourArea(c) >= MOTION_MIN_AREA for c in contours)
 
 
-# ---------- popup UI ----------
+# ---------- popup UI (per-process, but shared data behind a lock) ----------
 
-def open_known_popup(root, box, profiles):
+def open_known_popup(root, box, profiles, lock):
     name = box["name"]
     win = tk.Toplevel(root)
     win.title(name)
@@ -118,25 +140,28 @@ def open_known_popup(root, box, profiles):
         img.thumbnail((220, 220))
         photo = ImageTk.PhotoImage(img)
         img_label = tk.Label(win, image=photo)
-        img_label.image = photo  # keep a reference so it isn't garbage collected
+        img_label.image = photo
         img_label.pack(padx=10, pady=10)
 
     tk.Label(win, text=name, font=("Arial", 14, "bold")).pack(pady=(0, 10))
 
     tk.Label(win, text="Notes:").pack(anchor="w", padx=10)
     notes_box = tk.Text(win, width=35, height=6)
-    notes_box.insert("1.0", profiles.get(name, {}).get("notes", ""))
+    notes_box.insert("1.0", dict(profiles.get(name, {})).get("notes", ""))
     notes_box.pack(padx=10, pady=(0, 10))
 
     def save_notes():
-        profiles.setdefault(name, {})["notes"] = notes_box.get("1.0", "end").strip()
-        save_profiles(profiles)
+        with lock:
+            entry = dict(profiles.get(name, {}))
+            entry["notes"] = notes_box.get("1.0", "end").strip()
+            profiles[name] = entry  # must reassign whole entry — Manager dict doesn't proxy nested mutation
+            save_profiles_to_disk(profiles)
         win.destroy()
 
     tk.Button(win, text="Save", command=save_notes).pack(pady=(0, 10))
 
 
-def open_unknown_popup(root, box, known_encodings, known_names, profiles):
+def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
     win = tk.Toplevel(root)
     win.title("Unknown — Enroll")
 
@@ -171,38 +196,39 @@ def open_unknown_popup(root, box, known_encodings, known_names, profiles):
         photo_path = os.path.join(person_dir, f"{int(time.time())}.jpg")
         cv2.imwrite(photo_path, box["crop"])
 
-        known_encodings.append(encodings[0])
-        known_names.append(new_name)
-        save_known_faces(known_encodings, known_names)
+        with lock:
+            known_encodings.append(encodings[0])
+            known_names.append(new_name)
+            save_known_faces_to_disk(known_encodings, known_names)
 
-        profiles.setdefault(new_name, {"notes": ""})
-        save_profiles(profiles)
+            entry = dict(profiles.get(new_name, {"notes": ""}))
+            profiles[new_name] = entry
+            save_profiles_to_disk(profiles)
 
-        print(f"Enrolled new person: {new_name}")
+        print(f"Enrolled new person: {new_name} (now visible to all cameras)")
         win.destroy()
 
     tk.Button(win, text="Enroll as known", command=enroll).pack(pady=(0, 10))
 
 
-def make_mouse_callback(click_state, root, known_encodings, known_names, profiles):
+def make_mouse_callback(click_state, root, known_encodings, known_names, profiles, lock):
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         for box in click_state["boxes"]:
             if box["x1"] <= x <= box["x2"] and box["y1"] <= y <= box["y2"]:
                 if box["name"] == "Unknown":
-                    open_unknown_popup(root, box, known_encodings, known_names, profiles)
+                    open_unknown_popup(root, box, known_encodings, known_names, profiles, lock)
                 else:
-                    open_known_popup(root, box, profiles)
+                    open_known_popup(root, box, profiles, lock)
                 break
     return on_mouse
 
 
-# ---------- main loop ----------
+# ---------- per-camera worker (runs in its own process) ----------
 
-def main():
-    known_encodings, known_names = load_known_faces()
-    profiles = load_profiles()
+def camera_worker(camera_name, camera_type, source, known_encodings, known_names, profiles, lock):
+    mp_face_detection = mp.solutions.face_detection
     os.makedirs(FACE_SAVE_DIR, exist_ok=True)
 
     last_save_time = 0.0
@@ -211,22 +237,30 @@ def main():
     last_boxes_time = 0.0
 
     root = tk.Tk()
-    root.withdraw()  # no empty root window, just used to host popups + keep the Tk event loop alive
+    root.withdraw()
 
+    window_name = f"CAM: {camera_name}"
     click_state = {"boxes": []}
-    cv2.namedWindow("ESP32-CAM")
+    cv2.namedWindow(window_name)
     cv2.setMouseCallback(
-        "ESP32-CAM",
-        make_mouse_callback(click_state, root, known_encodings, known_names, profiles),
+        window_name,
+        make_mouse_callback(click_state, root, known_encodings, known_names, profiles, lock),
     )
 
-    print(f"Connecting to {STREAM_URL} ...")
+    if camera_type == "usb":
+        source_desc = f"USB device {source}"
+        frames = usb_frame_generator(source)
+    else:
+        source_desc = source
+        frames = frame_generator(source)
+
+    print(f"[{camera_name}] Connecting to {source_desc} ...")
     try:
         with mp_face_detection.FaceDetection(
             model_selection=0,
             min_detection_confidence=0.6,
         ) as detector:
-            for frame in frame_generator(STREAM_URL):
+            for frame in frames:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
 
@@ -240,6 +274,11 @@ def main():
                     results = detector.process(rgb_frame)
                     h, w = frame.shape[:2]
                     new_boxes = []
+
+                    # Snapshot the shared known-faces list once per frame rather
+                    # than hitting the Manager proxy per detected face — cheaper.
+                    local_encodings = list(known_encodings)
+                    local_names = list(known_names)
 
                     if results.detections:
                         for detection in results.detections:
@@ -258,11 +297,11 @@ def main():
                             )
 
                             name = "Unknown"
-                            if encodings and known_encodings:
-                                distances = face_recognition.face_distance(known_encodings, encodings[0])
+                            if encodings and local_encodings:
+                                distances = face_recognition.face_distance(local_encodings, encodings[0])
                                 best_match_idx = int(np.argmin(distances))
                                 if distances[best_match_idx] <= RECOGNITION_TOLERANCE:
-                                    name = known_names[best_match_idx]
+                                    name = local_names[best_match_idx]
 
                             pad_x = int(bw * CROP_PADDING)
                             pad_y = int(bh * CROP_PADDING)
@@ -281,18 +320,16 @@ def main():
                             if now - last_save_time >= SAVE_COOLDOWN_SEC:
                                 safe_name = name.replace(" ", "_")
                                 filename = os.path.join(
-                                    FACE_SAVE_DIR, f"{safe_name}_{int(now * 1000)}.jpg"
+                                    FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{int(now * 1000)}.jpg"
                                 )
                                 cv2.imwrite(filename, crop)
                                 last_save_time = now
-                                print(f"Saved face crop: {filename}")
+                                print(f"[{camera_name}] Saved: {filename}")
 
                     if new_boxes:
                         last_boxes = new_boxes
                         last_boxes_time = time.time()
 
-                # Draw persisted boxes (whether or not this exact frame had motion),
-                # so there's always a window of time to actually click one.
                 display_frame = frame
                 if last_boxes and (time.time() - last_boxes_time) < BOX_PERSIST_SEC:
                     for b in last_boxes:
@@ -304,17 +341,39 @@ def main():
                 else:
                     click_state["boxes"] = []
 
-                cv2.imshow("ESP32-CAM", display_frame)
-                root.update()  # non-blocking pump of the Tk event loop, keeps popups responsive
+                cv2.imshow(window_name, display_frame)
+                root.update()
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-    except requests.exceptions.RequestException as e:
-        print(f"Could not connect to stream: {e}")
-        print("Check STREAM_URL and that the ESP32 is powered on and connected.")
+    except Exception as e:
+        print(f"[{camera_name}] Stopped: {e}")
     finally:
-        cv2.destroyAllWindows()
+        cv2.destroyWindow(window_name)
         root.destroy()
 
 
+# ---------- launch one process per camera ----------
+
 if __name__ == "__main__":
-    main()
+    multiprocessing.set_start_method("spawn")  # safer than fork with native-threaded libs like mediapipe
+
+    manager = multiprocessing.Manager()
+    initial_encodings, initial_names = load_known_faces_from_disk()
+    initial_profiles = load_profiles_from_disk()
+
+    known_encodings = manager.list(initial_encodings)
+    known_names = manager.list(initial_names)
+    profiles = manager.dict(initial_profiles)
+    lock = manager.Lock()
+
+    processes = []
+    for cam in CAMERAS:
+        p = multiprocessing.Process(
+            target=camera_worker,
+            args=(cam["name"], cam["type"], cam["source"], known_encodings, known_names, profiles, lock),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()

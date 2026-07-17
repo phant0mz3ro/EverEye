@@ -5,7 +5,7 @@
  * Confirms camera init + WiFi + streaming work before adding SD/PIR/face logic.
  * View stream at: http://<device-ip>/stream
  */
-o
+
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "FS.h"
@@ -15,8 +15,8 @@ o
 // ===================
 // WiFi credentials
 // ===================
-const char* WIFI_SSID = "POCO C40";
-const char* WIFI_PASS = "dannyayo";
+const char* WIFI_SSID = "YOUR_SSID";
+const char* WIFI_PASS = "YOUR_PASSWORD";
 
 // ===================
 // NTP / timezone (Lagos = UTC+1, no DST)
@@ -28,9 +28,17 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // ===================
 // Snapshot timing
 // ===================
-const unsigned long SNAPSHOT_INTERVAL_MS = 60000; // every 30s for now — swap for PIR trigger later
+const unsigned long SNAPSHOT_INTERVAL_MS = 30000; // periodic baseline snapshots — kept alongside IR triggering, not replaced
 unsigned long lastSnapshotMs = 0;
 bool sdCardReady = false;
+
+// ===================
+// LM393 IR trigger
+// ===================
+#define IR_SENSOR_PIN 13          // free GPIO — SD_MMC 1-bit mode already claims 2, 14, 15
+#define IR_ACTIVE_STATE LOW       // most LM393 modules pull OUT low on detection — flip to HIGH if yours is inverted (test first, see notes)
+const unsigned long IR_TRIGGER_COOLDOWN_MS = 5000; // min gap between IR-triggered saves, avoids flooding SD if object lingers
+unsigned long lastIrSnapshotMs = 0;
 
 // ===================
 // AI-Thinker pin map
@@ -157,12 +165,14 @@ void setup() {
 
   startCameraServer();
 
+  pinMode(IR_SENSOR_PIN, INPUT);
+
   Serial.print("Camera ready. Stream at: http://");
   Serial.print(WiFi.localIP());
   Serial.println("/stream");
 }
 
-void saveSnapshot() {
+void saveSnapshot(const char* source) {
   if (!sdCardReady) return;
 
   camera_fb_t* fb = esp_camera_fb_get();
@@ -176,13 +186,15 @@ void saveSnapshot() {
     return;
   }
 
-  // Build timestamped filename; falls back to millis() if NTP never synced
-  char filename[64];
+  // Build timestamped filename tagged with trigger source; falls back to millis() if NTP never synced
+  char filename[80];
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 100)) {
-    strftime(filename, sizeof(filename), "/snapshots/%Y%m%d_%H%M%S.jpg", &timeinfo);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &timeinfo);
+    snprintf(filename, sizeof(filename), "/snapshots/%s_%s.jpg", source, timestamp);
   } else {
-    snprintf(filename, sizeof(filename), "/snapshots/snap_%lu.jpg", millis());
+    snprintf(filename, sizeof(filename), "/snapshots/%s_%lu.jpg", source, millis());
   }
 
   File file = SD_MMC.open(filename, FILE_WRITE);
@@ -200,9 +212,22 @@ void saveSnapshot() {
 
 void loop() {
   unsigned long now = millis();
+
+  // Baseline periodic snapshot — unchanged, still runs regardless of the IR sensor
   if (now - lastSnapshotMs >= SNAPSHOT_INTERVAL_MS) {
     lastSnapshotMs = now;
-    saveSnapshot();
+    saveSnapshot("timer");
   }
+
+  // IR-triggered snapshot — runs alongside the timer, own cooldown so a lingering
+  // object doesn't flood the SD card with near-duplicate saves
+  if (digitalRead(IR_SENSOR_PIN) == IR_ACTIVE_STATE) {
+    if (now - lastIrSnapshotMs >= IR_TRIGGER_COOLDOWN_MS) {
+      lastIrSnapshotMs = now;
+      Serial.println("IR trigger fired");
+      saveSnapshot("motion");
+    }
+  }
+
   delay(100); // keep loop() light so it doesn't starve the streaming task
 }
