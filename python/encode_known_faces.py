@@ -1,28 +1,42 @@
 """
-Step 6a: enroll known people.
+Step 6a: bulk-enroll known people from a folder of reference photos.
 
 Expected folder structure:
     known_faces/
-        daniel/
+        <any_folder_name>/
             photo1.jpg
             photo2.jpg
-        jane/
-            photo1.jpg
 
-One clean, front-facing photo per person is enough — more photos per
-person (different angles/lighting) improves robustness but isn't required.
+The folder name is just a convenient label while you're organizing photos —
+it is NOT the person's permanent identity. Each folder gets a unique ID
+generated at enrollment time, so two folders named "daniel" (two different
+people) get two different IDs and are never confused with each other.
 
-Run this once whenever you add/change known people, then re-run
-stream_client.py to pick up the new encodings.
+Run this once for bulk import, then use the live GUI's enroll popup for
+anyone added afterward — both write to the same encodings.pkl/profiles.json.
 """
 
+import json
 import os
 import pickle
+import uuid
 
 import face_recognition
 
 KNOWN_FACES_DIR = "known_faces"
 ENCODINGS_FILE = "encodings.pkl"
+PROFILES_FILE = "profiles.json"
+
+
+def generate_id():
+    return uuid.uuid4().hex[:8]
+
+
+def load_profiles():
+    if not os.path.exists(PROFILES_FILE):
+        return {}
+    with open(PROFILES_FILE, "r") as f:
+        return json.load(f)
 
 
 def main():
@@ -32,20 +46,20 @@ def main():
         return
 
     known_encodings = []
-    known_names = []
+    known_ids = []
+    profiles = load_profiles()
 
-    for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
-        person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
+    for folder_name in sorted(os.listdir(KNOWN_FACES_DIR)):
+        person_dir = os.path.join(KNOWN_FACES_DIR, folder_name)
         if not os.path.isdir(person_dir):
             continue
+
+        person_id = generate_id()
+        enrolled_any = False
 
         for filename in sorted(os.listdir(person_dir)):
             filepath = os.path.join(person_dir, filename)
             image = face_recognition.load_image_file(filepath)
-
-            # This enrollment step runs once and photos are curated (one clear
-            # face expected), so the extra detection cost here is fine — unlike
-            # the live pipeline where we reuse MediaPipe's box to avoid it.
             encodings = face_recognition.face_encodings(image)
 
             if not encodings:
@@ -55,18 +69,25 @@ def main():
                 print(f"  Multiple faces found in {filepath}, using the first one")
 
             known_encodings.append(encodings[0])
-            known_names.append(person_name)
-            print(f"Encoded: {person_name} <- {filename}")
+            known_ids.append(person_id)
+            enrolled_any = True
+            print(f"Encoded: {folder_name} (id={person_id}) <- {filename}")
+
+        if enrolled_any:
+            profiles[person_id] = {"name": folder_name, "age": ""}
 
     if not known_encodings:
         print("No faces encoded. Check your known_faces/ folder structure.")
         return
 
     with open(ENCODINGS_FILE, "wb") as f:
-        pickle.dump({"encodings": known_encodings, "names": known_names}, f)
+        pickle.dump({"encodings": known_encodings, "ids": known_ids}, f)
+
+    with open(PROFILES_FILE, "w") as f:
+        json.dump(profiles, f, indent=2)
 
     print(f"\nSaved {len(known_encodings)} encodings for "
-          f"{len(set(known_names))} people to {ENCODINGS_FILE}")
+          f"{len(set(known_ids))} people to {ENCODINGS_FILE} and {PROFILES_FILE}")
 
 
 if __name__ == "__main__":

@@ -1,21 +1,18 @@
 """
-Multi-camera, single-window version.
+Multi-camera security system with:
+  - ID-based identity (not name-based) — two people can share a display
+    name without being confused, since matching happens against a unique
+    ID, and "name" is just one editable field on that ID's profile.
+  - Match confidence shown on screen next to recognized names.
+  - Cameras can be added/removed live from a control panel window,
+    no restart needed.
 
-Each camera is now TWO processes, not one:
-  - capture_worker: pulls frames from the stream, builds the display
-    thumbnail, handles nothing CPU-heavy. Runs at full stream speed.
-  - detector_worker: does motion detection + face detection + recognition
-    + saving. Genuinely CPU-heavy (dlib CNN encoding). Runs in its own
-    OS process, so it competes for CPU cycles on its own core, not the
-    same GIL as capture_worker — capture never stutters when detection
-    fires, because they're not even in the same process anymore.
-
-They talk to each other via two small Queues (latest frame in, latest
-boxes out) — not through shared memory, so no locking needed between them.
+Architecture per camera: TWO processes (capture + detector), same as
+before — capture stays lightweight and never stutters, detector does the
+expensive CNN encoding in full isolation on its own core.
 
 Known faces / profiles are shared across ALL detector processes via
-multiprocessing.Manager — enroll on one camera, every camera recognizes
-them right after.
+multiprocessing.Manager.
 """
 
 import json
@@ -26,7 +23,9 @@ import pickle
 import queue as queue_module
 import time
 import tkinter as tk
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from tkinter import messagebox
 
 import cv2
 import face_recognition
@@ -36,10 +35,10 @@ import requests
 from PIL import Image, ImageTk
 
 # ===================
-# Camera list — "type": "http" for ESP32-CAM streams, "usb" for local webcams
-# For usb cameras, "source" is the device index (0, 1, ...) not a URL
+# Seed cameras — more can be added live from the control panel afterward
+# "type": "http" for ESP32-CAM streams, "usb" for local webcams
 # ===================
-CAMERAS = [
+INITIAL_CAMERAS = [
     {"name": "front_door", "type": "http", "source": "http://<esp32-ip-1>/stream"},
     {"name": "usb_test",   "type": "usb",  "source": 0},
 ]
@@ -57,28 +56,32 @@ PROFILES_FILE = "profiles.json"
 RECOGNITION_TOLERANCE = 0.6
 
 BOX_PERSIST_SEC = 4.0
-
-DETECTION_INTERVAL_SEC = 0.5  # detector process won't re-run more often than this
-PROCESS_SCALE = 0.5           # detection/encoding runs on a half-size frame
+DETECTION_INTERVAL_SEC = 0.5
+PROCESS_SCALE = 0.5
 
 THUMB_W = 320
 THUMB_H = 240
+
+
+def generate_id():
+    return uuid.uuid4().hex[:8]
 
 
 # ---------- disk persistence ----------
 
 def load_known_faces_from_disk():
     if not os.path.exists(ENCODINGS_FILE):
-        print(f"No {ENCODINGS_FILE} found — run encode_known_faces.py first.")
+        print(f"No {ENCODINGS_FILE} found — run encode_known_faces.py first, "
+              f"or enroll people live via the Unknown popup.")
         return [], []
     with open(ENCODINGS_FILE, "rb") as f:
         data = pickle.load(f)
-    return data["encodings"], data["names"]
+    return data["encodings"], data["ids"]
 
 
-def save_known_faces_to_disk(known_encodings, known_names):
+def save_known_faces_to_disk(known_encodings, known_ids):
     with open(ENCODINGS_FILE, "wb") as f:
-        pickle.dump({"encodings": list(known_encodings), "names": list(known_names)}, f)
+        pickle.dump({"encodings": list(known_encodings), "ids": list(known_ids)}, f)
 
 
 def load_profiles_from_disk():
@@ -93,8 +96,8 @@ def save_profiles_to_disk(profiles):
         json.dump(dict(profiles), f, indent=2)
 
 
-def get_reference_photo(name):
-    person_dir = os.path.join(KNOWN_FACES_DIR, name)
+def get_reference_photo(person_id):
+    person_dir = os.path.join(KNOWN_FACES_DIR, person_id)
     if not os.path.isdir(person_dir):
         return None
     for filename in sorted(os.listdir(person_dir)):
@@ -143,7 +146,6 @@ def detect_motion(prev_gray, curr_gray):
 
 
 def push_latest(q: multiprocessing.Queue, item):
-    """Keep only the newest item in a maxsize=1 queue — never blocks the sender."""
     try:
         q.get_nowait()
     except queue_module.Empty:
@@ -154,11 +156,11 @@ def push_latest(q: multiprocessing.Queue, item):
         pass
 
 
-# ---------- detector process: ALL the CPU-heavy work lives here, isolated ----------
+# ---------- detector process ----------
 
-def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxes_queue, stop_event):
+def detector_worker(camera_name, known_encodings, known_ids, profiles, frame_queue, boxes_queue, stop_event):
     os.makedirs(FACE_SAVE_DIR, exist_ok=True)
-    save_executor = ThreadPoolExecutor(max_workers=1)  # disk writes still shouldn't block this loop either
+    save_executor = ThreadPoolExecutor(max_workers=1)
 
     mp_face_detection = mp.solutions.face_detection
     prev_gray = None
@@ -198,7 +200,8 @@ def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxe
             new_boxes = []
 
             local_encodings = list(known_encodings)
-            local_names = list(known_names)
+            local_ids = list(known_ids)
+            local_profiles = dict(profiles)
 
             if results.detections:
                 for detection in results.detections:
@@ -222,12 +225,20 @@ def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxe
                         rgb_small, known_face_locations=face_location
                     )
 
-                    name = "Unknown"
+                    person_id = None
+                    display_name = "Unknown"
+                    confidence = None
+
                     if encodings and local_encodings:
                         distances = face_recognition.face_distance(local_encodings, encodings[0])
                         best_match_idx = int(np.argmin(distances))
-                        if distances[best_match_idx] <= RECOGNITION_TOLERANCE:
-                            name = local_names[best_match_idx]
+                        best_distance = distances[best_match_idx]
+                        if best_distance <= RECOGNITION_TOLERANCE:
+                            person_id = local_ids[best_match_idx]
+                            display_name = local_profiles.get(person_id, {}).get("name", person_id)
+                            # Rough similarity score, not a calibrated probability —
+                            # lower distance = better match, so invert it into a percentage
+                            confidence = round(max(0.0, 1.0 - best_distance) * 100)
 
                     pad_x = int(bw * CROP_PADDING)
                     pad_y = int(bh * CROP_PADDING)
@@ -239,12 +250,14 @@ def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxe
 
                     new_boxes.append({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "name": name, "crop": crop,
+                        "id": person_id, "name": display_name, "confidence": confidence,
+                        "crop": crop,
                     })
 
-                    safe_name = name.replace(" ", "_")
+                    safe_name = display_name.replace(" ", "_")
+                    id_tag = person_id or "unknown"
                     filename = os.path.join(
-                        FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{int(now * 1000)}.jpg"
+                        FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{id_tag}_{int(now * 1000)}.jpg"
                     )
                     save_executor.submit(cv2.imwrite, filename, crop)
                     print(f"[{camera_name}] Saving: {filename}")
@@ -255,7 +268,7 @@ def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxe
     save_executor.shutdown(wait=False)
 
 
-# ---------- capture process: lightweight, just pulls frames + displays ----------
+# ---------- capture process ----------
 
 def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue):
     if camera_type == "usb":
@@ -271,7 +284,7 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
     print(f"[{camera_name}] Connecting to {source_desc} ...")
     try:
         for frame in frames:
-            push_latest(frame_queue, frame)  # hand off to the detector process, non-blocking
+            push_latest(frame_queue, frame)
 
             try:
                 last_boxes = boxes_queue.get_nowait()
@@ -288,13 +301,17 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
                 for b in last_boxes:
                     tx1, ty1 = int(b["x1"] * scale_x), int(b["y1"] * scale_y)
                     tx2, ty2 = int(b["x2"] * scale_x), int(b["y2"] * scale_y)
-                    color = (0, 255, 0) if b["name"] != "Unknown" else (0, 0, 255)
+                    color = (0, 255, 0) if b["id"] is not None else (0, 0, 255)
+                    label = b["name"]
+                    if b["confidence"] is not None:
+                        label = f"{label} {b['confidence']}%"
                     cv2.rectangle(thumb, (tx1, ty1), (tx2, ty2), color, 2)
-                    cv2.putText(thumb, b["name"], (tx1, max(ty1 - 8, 10)),
+                    cv2.putText(thumb, label, (tx1, max(ty1 - 8, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
                     thumb_boxes.append({
                         "x1": tx1, "y1": ty1, "x2": tx2, "y2": ty2,
-                        "name": b["name"], "crop": b["crop"],
+                        "id": b["id"], "name": b["name"], "confidence": b["confidence"],
+                        "crop": b["crop"],
                     })
 
             push_latest(out_queue, {"frame": thumb, "boxes": thumb_boxes})
@@ -302,49 +319,87 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
         print(f"[{camera_name}] Stopped: {e}")
 
 
-# ---------- popup UI (runs in the main process only) ----------
+# ---------- popup UI (main process only) ----------
 
 def open_known_popup(root, box, profiles, lock):
-    name = box["name"]
+    person_id = box["id"]
+    profile = dict(profiles.get(person_id, {"name": box["name"], "age": ""}))
+
     win = tk.Toplevel(root)
-    win.title(name)
+    win.title(profile.get("name", person_id))
     win.resizable(True, True)
 
-    ref_path = get_reference_photo(name)
+    ref_path = get_reference_photo(person_id)
     if ref_path and os.path.exists(ref_path):
         img = Image.open(ref_path)
-        img.thumbnail((220, 220))
+        img.thumbnail((200, 200))
         photo = ImageTk.PhotoImage(img)
         img_label = tk.Label(win, image=photo)
         img_label.image = photo
         img_label.pack(padx=10, pady=10)
 
-    tk.Label(win, text=name, font=("Arial", 14, "bold")).pack(pady=(0, 10))
+    tk.Label(win, text=f"ID: {person_id}", fg="gray").pack()
+    if box["confidence"] is not None:
+        tk.Label(win, text=f"Match confidence: {box['confidence']}%", fg="gray").pack(pady=(0, 10))
 
-    tk.Label(win, text="Notes:").pack(anchor="w", padx=10)
-    notes_box = tk.Text(win, width=35, height=6)
-    notes_box.insert("1.0", dict(profiles.get(name, {})).get("notes", ""))
-    notes_box.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+    fields_frame = tk.Frame(win)
+    fields_frame.pack(padx=10, pady=5, fill="both", expand=True)
 
-    def save_notes():
+    field_rows = []  # list of (key, tk.Entry) — read at Save time
+
+    def add_row(key, value):
+        row = tk.Frame(fields_frame)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=f"{key}:", width=10, anchor="w").pack(side="left")
+        entry = tk.Entry(row)
+        entry.insert(0, value)
+        entry.pack(side="left", fill="x", expand=True)
+        field_rows.append((key, entry))
+
+    # Ensure name/age always show first, then any other custom fields
+    add_row("name", profile.get("name", ""))
+    add_row("age", profile.get("age", ""))
+    for key, value in profile.items():
+        if key not in ("name", "age"):
+            add_row(key, value)
+
+    # ---- add a brand new custom field ----
+    add_field_frame = tk.Frame(win)
+    add_field_frame.pack(padx=10, pady=(5, 0), fill="x")
+    tk.Label(add_field_frame, text="New field:").pack(side="left")
+    new_key_entry = tk.Entry(add_field_frame, width=10)
+    new_key_entry.pack(side="left", padx=(5, 2))
+    new_val_entry = tk.Entry(add_field_frame, width=12)
+    new_val_entry.pack(side="left", padx=2)
+
+    def add_new_field():
+        key = new_key_entry.get().strip()
+        if not key:
+            return
+        add_row(key, new_val_entry.get().strip())
+        new_key_entry.delete(0, "end")
+        new_val_entry.delete(0, "end")
+
+    tk.Button(add_field_frame, text="+", command=add_new_field).pack(side="left", padx=2)
+
+    def save_profile():
+        updated = {key: entry.get().strip() for key, entry in field_rows}
         with lock:
-            entry = dict(profiles.get(name, {}))
-            entry["notes"] = notes_box.get("1.0", "end").strip()
-            profiles[name] = entry
+            profiles[person_id] = updated
             save_profiles_to_disk(profiles)
         win.destroy()
 
-    tk.Button(win, text="Save", command=save_notes).pack(pady=(0, 10))
+    tk.Button(win, text="Save", command=save_profile).pack(pady=10)
 
 
-def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
+def open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock):
     win = tk.Toplevel(root)
     win.title("Unknown — Enroll")
     win.resizable(True, True)
 
     crop_rgb = cv2.cvtColor(box["crop"], cv2.COLOR_BGR2RGB)
     img = Image.fromarray(crop_rgb)
-    img.thumbnail((220, 220))
+    img.thumbnail((200, 200))
     photo = ImageTk.PhotoImage(img)
     img_label = tk.Label(win, image=photo)
     img_label.image = photo
@@ -352,7 +407,11 @@ def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
 
     tk.Label(win, text="Name:").pack(anchor="w", padx=10)
     name_entry = tk.Entry(win, width=30)
-    name_entry.pack(padx=10, pady=(0, 10))
+    name_entry.pack(padx=10, pady=(0, 5))
+
+    tk.Label(win, text="Age:").pack(anchor="w", padx=10)
+    age_entry = tk.Entry(win, width=30)
+    age_entry.pack(padx=10, pady=(0, 10))
 
     status_label = tk.Label(win, text="", fg="red")
     status_label.pack()
@@ -368,88 +427,188 @@ def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
             status_label.config(text="Couldn't encode this face — try a clearer capture")
             return
 
-        person_dir = os.path.join(KNOWN_FACES_DIR, new_name)
+        person_id = generate_id()
+        person_dir = os.path.join(KNOWN_FACES_DIR, person_id)
         os.makedirs(person_dir, exist_ok=True)
         photo_path = os.path.join(person_dir, f"{int(time.time())}.jpg")
         cv2.imwrite(photo_path, box["crop"])
 
         with lock:
             known_encodings.append(encodings[0])
-            known_names.append(new_name)
-            save_known_faces_to_disk(known_encodings, known_names)
+            known_ids.append(person_id)
+            save_known_faces_to_disk(known_encodings, known_ids)
 
-            entry = dict(profiles.get(new_name, {"notes": ""}))
-            profiles[new_name] = entry
+            profiles[person_id] = {"name": new_name, "age": age_entry.get().strip()}
             save_profiles_to_disk(profiles)
 
-        print(f"Enrolled new person: {new_name} (now visible to all cameras)")
+        print(f"Enrolled new person: {new_name} (id={person_id}, visible to all cameras)")
         win.destroy()
 
     tk.Button(win, text="Enroll as known", command=enroll).pack(pady=(0, 10))
 
 
-# ---------- main process: combine grid, handle clicks, launch workers ----------
+# ---------- camera lifecycle (add/remove live) ----------
+
+def start_camera(name, cam_type, source, known_encodings, known_ids, profiles, registry, manager):
+    """registry is a dict: name -> {process handles + queues}. Mutated in place."""
+    frame_queue = multiprocessing.Queue(maxsize=1)
+    boxes_queue = multiprocessing.Queue(maxsize=1)
+    out_queue = multiprocessing.Queue(maxsize=1)
+    stop_event = manager.Event()  # Manager-backed — avoids the raw-semaphore rebuild issue on spawn
+
+    detector_p = multiprocessing.Process(
+        target=detector_worker,
+        args=(name, known_encodings, known_ids, profiles, frame_queue, boxes_queue, stop_event),
+    )
+    capture_p = multiprocessing.Process(
+        target=capture_worker,
+        args=(name, cam_type, source, frame_queue, boxes_queue, out_queue),
+    )
+    detector_p.start()
+    capture_p.start()
+
+    registry[name] = {
+        "out_queue": out_queue,
+        "stop_event": stop_event,
+        "detector_p": detector_p,
+        "capture_p": capture_p,
+        "latest": None,
+    }
+
+
+def stop_camera(name, registry):
+    entry = registry.pop(name, None)
+    if entry is None:
+        return
+    entry["stop_event"].set()
+    entry["detector_p"].terminate()
+    entry["capture_p"].terminate()
+    entry["detector_p"].join()
+    entry["capture_p"].join()
+
+
+# ---------- control panel (visible Tk window) ----------
+
+def build_control_panel(root, registry, known_encodings, known_ids, profiles, manager):
+    panel = tk.Toplevel(root)
+    panel.title("Camera Control Panel")
+    panel.geometry("300x300")
+
+    tk.Label(panel, text="Active cameras:").pack(anchor="w", padx=10, pady=(10, 0))
+    listbox = tk.Listbox(panel)
+    listbox.pack(padx=10, pady=5, fill="both", expand=True)
+
+    def refresh_listbox():
+        listbox.delete(0, "end")
+        for cam_name in registry:
+            listbox.insert("end", cam_name)
+
+    def remove_selected():
+        selection = listbox.curselection()
+        if not selection:
+            return
+        cam_name = listbox.get(selection[0])
+        stop_camera(cam_name, registry)
+        refresh_listbox()
+
+    def open_add_form():
+        form = tk.Toplevel(panel)
+        form.title("Add Camera")
+
+        tk.Label(form, text="Name:").pack(anchor="w", padx=10, pady=(10, 0))
+        name_entry = tk.Entry(form, width=25)
+        name_entry.pack(padx=10)
+
+        tk.Label(form, text="Type:").pack(anchor="w", padx=10, pady=(10, 0))
+        type_var = tk.StringVar(value="http")
+        tk.OptionMenu(form, type_var, "http", "usb").pack(padx=10, anchor="w")
+
+        tk.Label(form, text="Source (URL for http, device index for usb):").pack(
+            anchor="w", padx=10, pady=(10, 0))
+        source_entry = tk.Entry(form, width=25)
+        source_entry.pack(padx=10)
+
+        status = tk.Label(form, text="", fg="red")
+        status.pack(pady=5)
+
+        def submit():
+            name = name_entry.get().strip()
+            cam_type = type_var.get()
+            source_raw = source_entry.get().strip()
+
+            if not name or not source_raw:
+                status.config(text="Fill in all fields")
+                return
+            if name in registry:
+                status.config(text="A camera with this name already exists")
+                return
+
+            source = source_raw
+            if cam_type == "usb":
+                try:
+                    source = int(source_raw)
+                except ValueError:
+                    status.config(text="USB source must be a device index number (e.g. 0)")
+                    return
+
+            start_camera(name, cam_type, source, known_encodings, known_ids, profiles, registry, manager)
+            refresh_listbox()
+            form.destroy()
+
+        tk.Button(form, text="Add", command=submit).pack(pady=10)
+
+    tk.Button(panel, text="Add Camera", command=open_add_form).pack(padx=10, pady=(0, 5), fill="x")
+    tk.Button(panel, text="Remove Selected", command=remove_selected).pack(padx=10, pady=(0, 10), fill="x")
+
+    refresh_listbox()
+    return refresh_listbox
+
+
+# ---------- main process ----------
 
 def main():
-    multiprocessing.set_start_method("spawn")
+    multiprocessing.set_start_method("fork")
 
     manager = multiprocessing.Manager()
-    initial_encodings, initial_names = load_known_faces_from_disk()
+    initial_encodings, initial_ids = load_known_faces_from_disk()
     initial_profiles = load_profiles_from_disk()
 
     known_encodings = manager.list(initial_encodings)
-    known_names = manager.list(initial_names)
+    known_ids = manager.list(initial_ids)
     profiles = manager.dict(initial_profiles)
     lock = manager.Lock()
 
-    n = len(CAMERAS)
-    cols = math.ceil(math.sqrt(n))
-    rows = math.ceil(n / cols)
-
-    out_queues = {}
-    processes = []
-    stop_event = multiprocessing.Event()
-
-    for cam in CAMERAS:
-        frame_queue = multiprocessing.Queue(maxsize=1)
-        boxes_queue = multiprocessing.Queue(maxsize=1)
-        out_queue = multiprocessing.Queue(maxsize=1)
-        out_queues[cam["name"]] = out_queue
-
-        detector_p = multiprocessing.Process(
-            target=detector_worker,
-            args=(cam["name"], known_encodings, known_names, frame_queue, boxes_queue, stop_event),
-        )
-        capture_p = multiprocessing.Process(
-            target=capture_worker,
-            args=(cam["name"], cam["type"], cam["source"], frame_queue, boxes_queue, out_queue),
-        )
-        detector_p.start()
-        capture_p.start()
-        processes.extend([detector_p, capture_p])
+    registry = {}  # camera_name -> {out_queue, stop_event, detector_p, capture_p, latest}
+    for cam in INITIAL_CAMERAS:
+        start_camera(cam["name"], cam["type"], cam["source"],
+                     known_encodings, known_ids, profiles, registry, manager)
 
     root = tk.Tk()
-    root.withdraw()
+    root.withdraw()  # only used to host Toplevels (control panel + popups)
+    build_control_panel(root, registry, known_encodings, known_ids, profiles, manager)
 
     window_name = "Security Cameras"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    latest = {}
-
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+        names = list(registry.keys())
+        cols = max(1, math.ceil(math.sqrt(len(names))))
         col, row = x // THUMB_W, y // THUMB_H
         idx = row * cols + col
-        if idx >= len(CAMERAS):
+        if idx >= len(names):
             return
-        camera_name = CAMERAS[idx]["name"]
+        cam_name = names[idx]
         local_x, local_y = x - col * THUMB_W, y - row * THUMB_H
 
-        for box in latest.get(camera_name, {}).get("boxes", []):
+        data = registry.get(cam_name, {}).get("latest")
+        if not data:
+            return
+        for box in data.get("boxes", []):
             if box["x1"] <= local_x <= box["x2"] and box["y1"] <= local_y <= box["y2"]:
-                if box["name"] == "Unknown":
-                    open_unknown_popup(root, box, known_encodings, known_names, profiles, lock)
+                if box["id"] is None:
+                    open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock)
                 else:
                     open_known_popup(root, box, profiles, lock)
                 break
@@ -458,21 +617,29 @@ def main():
 
     try:
         while True:
-            for cam in CAMERAS:
+            names = list(registry.keys())
+            n = len(names)
+            cols = max(1, math.ceil(math.sqrt(n))) if n else 1
+            rows = max(1, math.ceil(n / cols)) if n else 1
+
+            for cam_name in names:
                 try:
-                    latest[cam["name"]] = out_queues[cam["name"]].get_nowait()
+                    registry[cam_name]["latest"] = registry[cam_name]["out_queue"].get_nowait()
                 except queue_module.Empty:
                     pass
 
             canvas = np.zeros((rows * THUMB_H, cols * THUMB_W, 3), dtype=np.uint8)
-            for idx, cam in enumerate(CAMERAS):
+            if n == 0:
+                cv2.putText(canvas, "No cameras — use the control panel to add one",
+                            (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            for idx, cam_name in enumerate(names):
                 row, col = divmod(idx, cols)
                 y0, x0 = row * THUMB_H, col * THUMB_W
-                data = latest.get(cam["name"])
+                data = registry[cam_name]["latest"]
                 if data is not None:
                     canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data["frame"]
                 else:
-                    cv2.putText(canvas, f"{cam['name']}: connecting...",
+                    cv2.putText(canvas, f"{cam_name}: connecting...",
                                 (x0 + 20, y0 + THUMB_H // 2),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
@@ -481,13 +648,10 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        stop_event.set()
         cv2.destroyAllWindows()
+        for cam_name in list(registry.keys()):
+            stop_camera(cam_name, registry)
         root.destroy()
-        for p in processes:
-            p.terminate()
-        for p in processes:
-            p.join()
 
 
 if __name__ == "__main__":
