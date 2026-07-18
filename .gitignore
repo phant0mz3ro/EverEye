@@ -1,1 +1,36 @@
-python/detected_faces
+# ===================
+# Personal / biometric data — never commit real people's faces or info
+# ===================
+server/known_faces/
+server/detected_faces/
+server/encodings.pkl
+server/profiles.json
+
+# ===================
+# Secrets — WiFi credentials are currently hardcoded in the .ino (see note below)
+# ===================
+esp32/CameraWebServer/wifi_config.h
+
+# ===================
+# Python
+# ===================
+__pycache__/
+*.pyc
+venv-cam/
+venv/
+.venv/
+*.egg-info/
+
+# ===================
+# Arduino / PlatformIO build artifacts (harmless either way, but noisy)
+# ===================
+.pio/
+build/
+*.bin
+*.elf
+
+# ===================
+# OS/editor noise
+# ===================
+.vscode/
+*.swp

@@ -15,8 +15,7 @@
 // ===================
 // WiFi credentials
 // ===================
-const char* WIFI_SSID = "YOUR_SSID";
-const char* WIFI_PASS = "YOUR_PASSWORD";
+#include "wifi_config.h"
 
 // ===================
 // NTP / timezone (Lagos = UTC+1, no DST)
