@@ -1,22 +1,32 @@
 """
-Multi-camera version: one process per camera, each running the full
-detect -> recognize -> display -> click pipeline independently.
+Multi-camera, single-window version.
 
-Known faces / profiles are shared across all camera processes via
-multiprocessing.Manager, so enrolling someone on one camera makes them
-recognizable on every other camera immediately (not just after restart).
+Each camera is now TWO processes, not one:
+  - capture_worker: pulls frames from the stream, builds the display
+    thumbnail, handles nothing CPU-heavy. Runs at full stream speed.
+  - detector_worker: does motion detection + face detection + recognition
+    + saving. Genuinely CPU-heavy (dlib CNN encoding). Runs in its own
+    OS process, so it competes for CPU cycles on its own core, not the
+    same GIL as capture_worker — capture never stutters when detection
+    fires, because they're not even in the same process anymore.
 
-Each camera gets its own OpenCV window and its own hidden Tk root
-(GUI state can't be shared across processes, so this is per-process
-by necessity — it's fine, each camera's popups are independent anyway).
+They talk to each other via two small Queues (latest frame in, latest
+boxes out) — not through shared memory, so no locking needed between them.
+
+Known faces / profiles are shared across ALL detector processes via
+multiprocessing.Manager — enroll on one camera, every camera recognizes
+them right after.
 """
 
 import json
+import math
 import multiprocessing
 import os
 import pickle
+import queue as queue_module
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import face_recognition
@@ -30,8 +40,8 @@ from PIL import Image, ImageTk
 # For usb cameras, "source" is the device index (0, 1, ...) not a URL
 # ===================
 CAMERAS = [
-    {"name": "front_door", "type": "http", "source": "http://10.235.220.104/stream"},
-    {"name": "usb_test",   "type": "usb",  "source": 2},
+    {"name": "front_door", "type": "http", "source": "http://<esp32-ip-1>/stream"},
+    {"name": "usb_test",   "type": "usb",  "source": 0},
 ]
 
 FACE_SAVE_DIR = "detected_faces"
@@ -48,8 +58,14 @@ RECOGNITION_TOLERANCE = 0.6
 
 BOX_PERSIST_SEC = 4.0
 
+DETECTION_INTERVAL_SEC = 0.5  # detector process won't re-run more often than this
+PROCESS_SCALE = 0.5           # detection/encoding runs on a half-size frame
 
-# ---------- disk persistence (used at startup + on every write-back) ----------
+THUMB_W = 320
+THUMB_H = 240
+
+
+# ---------- disk persistence ----------
 
 def load_known_faces_from_disk():
     if not os.path.exists(ENCODINGS_FILE):
@@ -61,7 +77,6 @@ def load_known_faces_from_disk():
 
 
 def save_known_faces_to_disk(known_encodings, known_names):
-    # Convert Manager proxies to plain list/str before pickling
     with open(ENCODINGS_FILE, "wb") as f:
         pickle.dump({"encodings": list(known_encodings), "names": list(known_names)}, f)
 
@@ -87,7 +102,7 @@ def get_reference_photo(name):
     return None
 
 
-# ---------- stream + motion (identical to single-camera version) ----------
+# ---------- frame sources ----------
 
 def frame_generator(url: str):
     stream = requests.get(url, stream=True, timeout=10)
@@ -127,12 +142,173 @@ def detect_motion(prev_gray, curr_gray):
     return any(cv2.contourArea(c) >= MOTION_MIN_AREA for c in contours)
 
 
-# ---------- popup UI (per-process, but shared data behind a lock) ----------
+def push_latest(q: multiprocessing.Queue, item):
+    """Keep only the newest item in a maxsize=1 queue — never blocks the sender."""
+    try:
+        q.get_nowait()
+    except queue_module.Empty:
+        pass
+    try:
+        q.put_nowait(item)
+    except queue_module.Full:
+        pass
+
+
+# ---------- detector process: ALL the CPU-heavy work lives here, isolated ----------
+
+def detector_worker(camera_name, known_encodings, known_names, frame_queue, boxes_queue, stop_event):
+    os.makedirs(FACE_SAVE_DIR, exist_ok=True)
+    save_executor = ThreadPoolExecutor(max_workers=1)  # disk writes still shouldn't block this loop either
+
+    mp_face_detection = mp.solutions.face_detection
+    prev_gray = None
+    last_detection_time = 0.0
+
+    with mp_face_detection.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.6,
+    ) as detector:
+        while not stop_event.is_set():
+            try:
+                frame = frame_queue.get(timeout=0.2)
+            except queue_module.Empty:
+                continue
+
+            now = time.time()
+            if now - last_detection_time < DETECTION_INTERVAL_SEC:
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+            motion = False
+            if prev_gray is not None:
+                motion = detect_motion(prev_gray, gray_blurred)
+            prev_gray = gray_blurred
+
+            if not motion:
+                continue
+
+            last_detection_time = now
+
+            small = cv2.resize(frame, None, fx=PROCESS_SCALE, fy=PROCESS_SCALE)
+            rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            results = detector.process(rgb_small)
+            sh, sw = small.shape[:2]
+            h, w = frame.shape[:2]
+            new_boxes = []
+
+            local_encodings = list(known_encodings)
+            local_names = list(known_names)
+
+            if results.detections:
+                for detection in results.detections:
+                    box = detection.location_data.relative_bounding_box
+                    x1 = max(int(box.xmin * w), 0)
+                    y1 = max(int(box.ymin * h), 0)
+                    bw = int(box.width * w)
+                    bh = int(box.height * h)
+                    x2, y2 = min(x1 + bw, w), min(y1 + bh, h)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    sx1 = max(int(box.xmin * sw), 0)
+                    sy1 = max(int(box.ymin * sh), 0)
+                    sbw = int(box.width * sw)
+                    sbh = int(box.height * sh)
+                    sx2, sy2 = min(sx1 + sbw, sw), min(sy1 + sbh, sh)
+
+                    face_location = [(sy1, sx2, sy2, sx1)]
+                    encodings = face_recognition.face_encodings(
+                        rgb_small, known_face_locations=face_location
+                    )
+
+                    name = "Unknown"
+                    if encodings and local_encodings:
+                        distances = face_recognition.face_distance(local_encodings, encodings[0])
+                        best_match_idx = int(np.argmin(distances))
+                        if distances[best_match_idx] <= RECOGNITION_TOLERANCE:
+                            name = local_names[best_match_idx]
+
+                    pad_x = int(bw * CROP_PADDING)
+                    pad_y = int(bh * CROP_PADDING)
+                    cx1 = max(x1 - pad_x, 0)
+                    cy1 = max(y1 - pad_y, 0)
+                    cx2 = min(x2 + pad_x, w)
+                    cy2 = min(y2 + pad_y, h)
+                    crop = frame[cy1:cy2, cx1:cx2].copy()
+
+                    new_boxes.append({
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "name": name, "crop": crop,
+                    })
+
+                    safe_name = name.replace(" ", "_")
+                    filename = os.path.join(
+                        FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{int(now * 1000)}.jpg"
+                    )
+                    save_executor.submit(cv2.imwrite, filename, crop)
+                    print(f"[{camera_name}] Saving: {filename}")
+
+            if new_boxes:
+                push_latest(boxes_queue, new_boxes)
+
+    save_executor.shutdown(wait=False)
+
+
+# ---------- capture process: lightweight, just pulls frames + displays ----------
+
+def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue):
+    if camera_type == "usb":
+        source_desc = f"USB device {source}"
+        frames = usb_frame_generator(source)
+    else:
+        source_desc = source
+        frames = frame_generator(source)
+
+    last_boxes = []
+    last_boxes_time = 0.0
+
+    print(f"[{camera_name}] Connecting to {source_desc} ...")
+    try:
+        for frame in frames:
+            push_latest(frame_queue, frame)  # hand off to the detector process, non-blocking
+
+            try:
+                last_boxes = boxes_queue.get_nowait()
+                last_boxes_time = time.time()
+            except queue_module.Empty:
+                pass
+
+            h, w = frame.shape[:2]
+            scale_x, scale_y = THUMB_W / w, THUMB_H / h
+            thumb = cv2.resize(frame, (THUMB_W, THUMB_H))
+
+            thumb_boxes = []
+            if last_boxes and (time.time() - last_boxes_time) < BOX_PERSIST_SEC:
+                for b in last_boxes:
+                    tx1, ty1 = int(b["x1"] * scale_x), int(b["y1"] * scale_y)
+                    tx2, ty2 = int(b["x2"] * scale_x), int(b["y2"] * scale_y)
+                    color = (0, 255, 0) if b["name"] != "Unknown" else (0, 0, 255)
+                    cv2.rectangle(thumb, (tx1, ty1), (tx2, ty2), color, 2)
+                    cv2.putText(thumb, b["name"], (tx1, max(ty1 - 8, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                    thumb_boxes.append({
+                        "x1": tx1, "y1": ty1, "x2": tx2, "y2": ty2,
+                        "name": b["name"], "crop": b["crop"],
+                    })
+
+            push_latest(out_queue, {"frame": thumb, "boxes": thumb_boxes})
+    except Exception as e:
+        print(f"[{camera_name}] Stopped: {e}")
+
+
+# ---------- popup UI (runs in the main process only) ----------
 
 def open_known_popup(root, box, profiles, lock):
     name = box["name"]
     win = tk.Toplevel(root)
     win.title(name)
+    win.resizable(True, True)
 
     ref_path = get_reference_photo(name)
     if ref_path and os.path.exists(ref_path):
@@ -148,13 +324,13 @@ def open_known_popup(root, box, profiles, lock):
     tk.Label(win, text="Notes:").pack(anchor="w", padx=10)
     notes_box = tk.Text(win, width=35, height=6)
     notes_box.insert("1.0", dict(profiles.get(name, {})).get("notes", ""))
-    notes_box.pack(padx=10, pady=(0, 10))
+    notes_box.pack(padx=10, pady=(0, 10), fill="both", expand=True)
 
     def save_notes():
         with lock:
             entry = dict(profiles.get(name, {}))
             entry["notes"] = notes_box.get("1.0", "end").strip()
-            profiles[name] = entry  # must reassign whole entry — Manager dict doesn't proxy nested mutation
+            profiles[name] = entry
             save_profiles_to_disk(profiles)
         win.destroy()
 
@@ -164,6 +340,7 @@ def open_known_popup(root, box, profiles, lock):
 def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
     win = tk.Toplevel(root)
     win.title("Unknown — Enroll")
+    win.resizable(True, True)
 
     crop_rgb = cv2.cvtColor(box["crop"], cv2.COLOR_BGR2RGB)
     img = Image.fromarray(crop_rgb)
@@ -211,151 +388,10 @@ def open_unknown_popup(root, box, known_encodings, known_names, profiles, lock):
     tk.Button(win, text="Enroll as known", command=enroll).pack(pady=(0, 10))
 
 
-def make_mouse_callback(click_state, root, known_encodings, known_names, profiles, lock):
-    def on_mouse(event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        for box in click_state["boxes"]:
-            if box["x1"] <= x <= box["x2"] and box["y1"] <= y <= box["y2"]:
-                if box["name"] == "Unknown":
-                    open_unknown_popup(root, box, known_encodings, known_names, profiles, lock)
-                else:
-                    open_known_popup(root, box, profiles, lock)
-                break
-    return on_mouse
+# ---------- main process: combine grid, handle clicks, launch workers ----------
 
-
-# ---------- per-camera worker (runs in its own process) ----------
-
-def camera_worker(camera_name, camera_type, source, known_encodings, known_names, profiles, lock):
-    mp_face_detection = mp.solutions.face_detection
-    os.makedirs(FACE_SAVE_DIR, exist_ok=True)
-
-    last_save_time = 0.0
-    prev_gray = None
-    last_boxes = []
-    last_boxes_time = 0.0
-
-    root = tk.Tk()
-    root.withdraw()
-
-    window_name = f"CAM: {camera_name}"
-    click_state = {"boxes": []}
-    cv2.namedWindow(window_name)
-    cv2.setMouseCallback(
-        window_name,
-        make_mouse_callback(click_state, root, known_encodings, known_names, profiles, lock),
-    )
-
-    if camera_type == "usb":
-        source_desc = f"USB device {source}"
-        frames = usb_frame_generator(source)
-    else:
-        source_desc = source
-        frames = frame_generator(source)
-
-    print(f"[{camera_name}] Connecting to {source_desc} ...")
-    try:
-        with mp_face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.6,
-        ) as detector:
-            for frame in frames:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
-
-                motion = False
-                if prev_gray is not None:
-                    motion = detect_motion(prev_gray, gray_blurred)
-                prev_gray = gray_blurred
-
-                if motion:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = detector.process(rgb_frame)
-                    h, w = frame.shape[:2]
-                    new_boxes = []
-
-                    # Snapshot the shared known-faces list once per frame rather
-                    # than hitting the Manager proxy per detected face — cheaper.
-                    local_encodings = list(known_encodings)
-                    local_names = list(known_names)
-
-                    if results.detections:
-                        for detection in results.detections:
-                            box = detection.location_data.relative_bounding_box
-                            x1 = max(int(box.xmin * w), 0)
-                            y1 = max(int(box.ymin * h), 0)
-                            bw = int(box.width * w)
-                            bh = int(box.height * h)
-                            x2, y2 = min(x1 + bw, w), min(y1 + bh, h)
-                            if x2 <= x1 or y2 <= y1:
-                                continue
-
-                            face_location = [(y1, x2, y2, x1)]
-                            encodings = face_recognition.face_encodings(
-                                rgb_frame, known_face_locations=face_location
-                            )
-
-                            name = "Unknown"
-                            if encodings and local_encodings:
-                                distances = face_recognition.face_distance(local_encodings, encodings[0])
-                                best_match_idx = int(np.argmin(distances))
-                                if distances[best_match_idx] <= RECOGNITION_TOLERANCE:
-                                    name = local_names[best_match_idx]
-
-                            pad_x = int(bw * CROP_PADDING)
-                            pad_y = int(bh * CROP_PADDING)
-                            cx1 = max(x1 - pad_x, 0)
-                            cy1 = max(y1 - pad_y, 0)
-                            cx2 = min(x2 + pad_x, w)
-                            cy2 = min(y2 + pad_y, h)
-                            crop = frame[cy1:cy2, cx1:cx2].copy()
-
-                            new_boxes.append({
-                                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                                "name": name, "crop": crop,
-                            })
-
-                            now = time.time()
-                            if now - last_save_time >= SAVE_COOLDOWN_SEC:
-                                safe_name = name.replace(" ", "_")
-                                filename = os.path.join(
-                                    FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{int(now * 1000)}.jpg"
-                                )
-                                cv2.imwrite(filename, crop)
-                                last_save_time = now
-                                print(f"[{camera_name}] Saved: {filename}")
-
-                    if new_boxes:
-                        last_boxes = new_boxes
-                        last_boxes_time = time.time()
-
-                display_frame = frame
-                if last_boxes and (time.time() - last_boxes_time) < BOX_PERSIST_SEC:
-                    for b in last_boxes:
-                        color = (0, 255, 0) if b["name"] != "Unknown" else (0, 0, 255)
-                        cv2.rectangle(display_frame, (b["x1"], b["y1"]), (b["x2"], b["y2"]), color, 2)
-                        cv2.putText(display_frame, b["name"], (b["x1"], b["y1"] - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                    click_state["boxes"] = last_boxes
-                else:
-                    click_state["boxes"] = []
-
-                cv2.imshow(window_name, display_frame)
-                root.update()
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-    except Exception as e:
-        print(f"[{camera_name}] Stopped: {e}")
-    finally:
-        cv2.destroyWindow(window_name)
-        root.destroy()
-
-
-# ---------- launch one process per camera ----------
-
-if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn")  # safer than fork with native-threaded libs like mediapipe
+def main():
+    multiprocessing.set_start_method("spawn")
 
     manager = multiprocessing.Manager()
     initial_encodings, initial_names = load_known_faces_from_disk()
@@ -366,14 +402,93 @@ if __name__ == "__main__":
     profiles = manager.dict(initial_profiles)
     lock = manager.Lock()
 
-    processes = []
-    for cam in CAMERAS:
-        p = multiprocessing.Process(
-            target=camera_worker,
-            args=(cam["name"], cam["type"], cam["source"], known_encodings, known_names, profiles, lock),
-        )
-        p.start()
-        processes.append(p)
+    n = len(CAMERAS)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
 
-    for p in processes:
-        p.join()
+    out_queues = {}
+    processes = []
+    stop_event = multiprocessing.Event()
+
+    for cam in CAMERAS:
+        frame_queue = multiprocessing.Queue(maxsize=1)
+        boxes_queue = multiprocessing.Queue(maxsize=1)
+        out_queue = multiprocessing.Queue(maxsize=1)
+        out_queues[cam["name"]] = out_queue
+
+        detector_p = multiprocessing.Process(
+            target=detector_worker,
+            args=(cam["name"], known_encodings, known_names, frame_queue, boxes_queue, stop_event),
+        )
+        capture_p = multiprocessing.Process(
+            target=capture_worker,
+            args=(cam["name"], cam["type"], cam["source"], frame_queue, boxes_queue, out_queue),
+        )
+        detector_p.start()
+        capture_p.start()
+        processes.extend([detector_p, capture_p])
+
+    root = tk.Tk()
+    root.withdraw()
+
+    window_name = "Security Cameras"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    latest = {}
+
+    def on_mouse(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        col, row = x // THUMB_W, y // THUMB_H
+        idx = row * cols + col
+        if idx >= len(CAMERAS):
+            return
+        camera_name = CAMERAS[idx]["name"]
+        local_x, local_y = x - col * THUMB_W, y - row * THUMB_H
+
+        for box in latest.get(camera_name, {}).get("boxes", []):
+            if box["x1"] <= local_x <= box["x2"] and box["y1"] <= local_y <= box["y2"]:
+                if box["name"] == "Unknown":
+                    open_unknown_popup(root, box, known_encodings, known_names, profiles, lock)
+                else:
+                    open_known_popup(root, box, profiles, lock)
+                break
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
+    try:
+        while True:
+            for cam in CAMERAS:
+                try:
+                    latest[cam["name"]] = out_queues[cam["name"]].get_nowait()
+                except queue_module.Empty:
+                    pass
+
+            canvas = np.zeros((rows * THUMB_H, cols * THUMB_W, 3), dtype=np.uint8)
+            for idx, cam in enumerate(CAMERAS):
+                row, col = divmod(idx, cols)
+                y0, x0 = row * THUMB_H, col * THUMB_W
+                data = latest.get(cam["name"])
+                if data is not None:
+                    canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data["frame"]
+                else:
+                    cv2.putText(canvas, f"{cam['name']}: connecting...",
+                                (x0 + 20, y0 + THUMB_H // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+            cv2.imshow(window_name, canvas)
+            root.update()
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        stop_event.set()
+        cv2.destroyAllWindows()
+        root.destroy()
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join()
+
+
+if __name__ == "__main__":
+    main()
