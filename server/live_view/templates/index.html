@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LUMEN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+    :root {
+        --bg: #0B0E13;
+        --surface: #151A22;
+        --border: #232B36;
+        --text: #E4E8EE;
+        --muted: #6B7684;
+        --accent: #FFB000;
+        --offline: #3A3F4A;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'IBM Plex Sans', sans-serif;
+        min-height: 100vh;
+    }
+
+    header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 24px 32px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .wordmark {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.18em;
+        color: var(--text);
+    }
+
+    .status-line {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.04em;
+    }
+
+    main {
+        padding: 32px;
+        max-width: 1100px;
+        margin: 0 auto;
+    }
+
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 16px;
+    }
+
+    .card {
+        display: block;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 20px;
+        text-decoration: none;
+        color: inherit;
+        transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+
+    .card:hover {
+        border-color: var(--accent);
+        transform: translateY(-1px);
+    }
+
+    .card:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    .card-top {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 14px;
+    }
+
+    .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--offline);
+        flex-shrink: 0;
+    }
+
+    .dot.live {
+        background: var(--accent);
+        box-shadow: 0 0 0 0 rgba(255, 176, 0, 0.5);
+        animation: pulse 2s ease-out infinite;
+    }
+
+    @keyframes pulse {
+        0%   { box-shadow: 0 0 0 0 rgba(255, 176, 0, 0.5); }
+        70%  { box-shadow: 0 0 0 8px rgba(255, 176, 0, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(255, 176, 0, 0); }
+    }
+
+    .camera-name {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 14px;
+        font-weight: 500;
+    }
+
+    .camera-status {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 11px;
+        color: var(--muted);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+
+    .camera-status.live { color: var(--accent); }
+
+    .empty {
+        font-family: 'IBM Plex Mono', monospace;
+        color: var(--muted);
+        font-size: 13px;
+        padding: 40px 0;
+        text-align: center;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .dot.live { animation: none; }
+        .card { transition: none; }
+    }
+</style>
+</head>
+<body>
+    <header>
+        <div class="wordmark">LUMEN</div>
+        <div class="status-line">{{ online_count }} of {{ total_count }} online</div>
+    </header>
+
+    <main>
+        {% if cameras %}
+        <div class="grid">
+            {% for cam in cameras %}
+            <a class="card" href="/camera/{{ cam.name }}">
+                <div class="card-top">
+                    <span class="dot {% if cam.online %}live{% endif %}"></span>
+                    <span class="camera-name">{{ cam.name }}</span>
+                </div>
+                <div class="camera-status {% if cam.online %}live{% endif %}">
+                    {% if cam.online %}live{% else %}offline{% endif %}
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty">No cameras configured</div>
+        {% endif %}
+    </main>
+</body>
+</html>

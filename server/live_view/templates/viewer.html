@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LUMEN — {{ camera_name }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+    :root {
+        --bg: #0B0E13;
+        --surface: #151A22;
+        --border: #232B36;
+        --text: #E4E8EE;
+        --muted: #6B7684;
+        --accent: #FFB000;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'IBM Plex Sans', sans-serif;
+        min-height: 100vh;
+    }
+
+    header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 24px 32px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .back {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 13px;
+        color: var(--muted);
+        text-decoration: none;
+    }
+
+    .back:hover { color: var(--text); }
+
+    .camera-name {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+    }
+
+    main {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 32px;
+    }
+
+    .frame {
+        width: 100%;
+        max-width: 900px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        overflow: hidden;
+        background: #000;
+        position: relative;
+    }
+
+    video {
+        width: 100%;
+        display: block;
+    }
+
+    .status-bar {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 12px;
+        letter-spacing: 0.04em;
+    }
+
+    .status-bar.connected { color: var(--accent); }
+</style>
+</head>
+<body>
+    <header>
+        <a class="back" href="/">&larr; all cameras</a>
+        <span class="camera-name">{{ camera_name }}</span>
+    </header>
+
+    <main>
+        <div class="frame">
+            <video id="video" autoplay playsinline muted></video>
+        </div>
+        <div class="status-bar" id="status">connecting...</div>
+    </main>
+
+    <script>
+        const cameraName = "{{ camera_name }}";
+        const video = document.getElementById('video');
+        const status = document.getElementById('status');
+        const ws = new WebSocket(`ws://${location.host}/ws/${cameraName}`);
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        pc.ontrack = (event) => {
+            video.srcObject = event.streams[0];
+        };
+
+        pc.onconnectionstatechange = () => {
+            status.textContent = pc.connectionState;
+            status.classList.toggle('connected', pc.connectionState === 'connected');
+        };
+
+        ws.onopen = async () => {
+            pc.addTransceiver('video', { direction: 'recvonly' });
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            await new Promise((resolve) => {
+                if (pc.iceGatheringState === 'complete') {
+                    resolve();
+                } else {
+                    pc.onicegatheringstatechange = () => {
+                        if (pc.iceGatheringState === 'complete') resolve();
+                    };
+                }
+            });
+
+            ws.send(JSON.stringify({
+                sdp: pc.localDescription.sdp,
+                type: pc.localDescription.type,
+            }));
+        };
+
+        ws.onmessage = async (event) => {
+            const message = JSON.parse(event.data);
+            await pc.setRemoteDescription(new RTCSessionDescription(message));
+        };
+
+        ws.onerror = () => {
+            status.textContent = "connection error";
+        };
+    </script>
+</body>
+</html>

@@ -224,7 +224,7 @@ def main():
     try:
         with mp_face_detection.FaceDetection(
             model_selection=0,
-            min_detection_confidence=0.6,
+            min_detection_confidence=0.7,
         ) as detector:
             for frame in frame_generator(STREAM_URL):
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

@@ -62,6 +62,10 @@ PROCESS_SCALE = 0.5
 THUMB_W = 320
 THUMB_H = 240
 
+RECORDINGS_DIR = "recordings"
+RECORDING_SEGMENT_SEC = 5 * 60  # new file every 30 minutes
+RECORD_FPS = 15  # approximate — actual pull rate varies, this just sets playback speed metadata
+
 
 def generate_id():
     return uuid.uuid4().hex[:8]
@@ -268,6 +272,17 @@ def detector_worker(camera_name, known_encodings, known_ids, profiles, frame_que
     save_executor.shutdown(wait=False)
 
 
+def open_new_segment(camera_name, frame_w, frame_h):
+    cam_dir = os.path.join(RECORDINGS_DIR, camera_name)
+    os.makedirs(cam_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(cam_dir, f"{timestamp}.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(filepath, fourcc, RECORD_FPS, (frame_w, frame_h))
+    print(f"[{camera_name}] Recording new segment: {filepath}")
+    return writer
+
+
 # ---------- capture process ----------
 
 def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue):
@@ -281,10 +296,23 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
     last_boxes = []
     last_boxes_time = 0.0
 
+    writer = None
+    segment_start_time = 0.0
+
     print(f"[{camera_name}] Connecting to {source_desc} ...")
     try:
         for frame in frames:
             push_latest(frame_queue, frame)
+
+            h, w = frame.shape[:2]
+
+            now = time.time()
+            if writer is None or (now - segment_start_time) >= RECORDING_SEGMENT_SEC:
+                if writer is not None:
+                    writer.release()
+                writer = open_new_segment(camera_name, w, h)
+                segment_start_time = now
+            writer.write(frame)
 
             try:
                 last_boxes = boxes_queue.get_nowait()
@@ -292,7 +320,6 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
             except queue_module.Empty:
                 pass
 
-            h, w = frame.shape[:2]
             scale_x, scale_y = THUMB_W / w, THUMB_H / h
             thumb = cv2.resize(frame, (THUMB_W, THUMB_H))
 
@@ -317,6 +344,9 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
             push_latest(out_queue, {"frame": thumb, "boxes": thumb_boxes})
     except Exception as e:
         print(f"[{camera_name}] Stopped: {e}")
+    finally:
+        if writer is not None:
+            writer.release()
 
 
 # ---------- popup UI (main process only) ----------

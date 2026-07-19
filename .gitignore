@@ -5,6 +5,8 @@ server/known_faces/
 server/detected_faces/
 server/encodings.pkl
 server/profiles.json
+server/recordings/
+
 
 # ===================
 # Secrets — WiFi credentials are currently hardcoded in the .ino (see note below)
