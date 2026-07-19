@@ -21,6 +21,7 @@ import multiprocessing
 import os
 import pickle
 import queue as queue_module
+import threading
 import time
 import tkinter as tk
 import uuid
@@ -32,7 +33,14 @@ import face_recognition
 import mediapipe as mp
 import numpy as np
 import requests
+import uvicorn
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from av import VideoFrame
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageTk
+from starlette.requests import Request
 
 # ===================
 # Seed cameras — more can be added live from the control panel afterward
@@ -63,8 +71,21 @@ THUMB_W = 320
 THUMB_H = 240
 
 RECORDINGS_DIR = "recordings"
-RECORDING_SEGMENT_SEC = 5 * 60  # new file every 30 minutes
-RECORD_FPS = 15  # approximate — actual pull rate varies, this just sets playback speed metadata
+RECORDING_SEGMENT_SEC = 30 * 60  # new file every 30 minutes
+RECORD_FPS = 10  # approximate — actual pull rate varies, this just sets playback speed metadata
+
+# ---------- web/live-view layer ----------
+# registry is THE single source of truth for which cameras exist — the
+# desktop control panel adds/removes cameras here, and the web layer below
+# just reads whatever's currently in it. No separate camera list to keep
+# in sync, because there isn't a second one.
+registry = {}  # camera_name -> {out_queue, stop_event, detector_p, capture_p, latest, latest_time}
+registry_lock = threading.Lock()
+
+RTC_CONFIG = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
+STALE_AFTER_SEC = 5  # no new frame in this long = considered offline on the web camera list
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8000
 
 
 def generate_id():
@@ -285,7 +306,7 @@ def open_new_segment(camera_name, frame_w, frame_h):
 
 # ---------- capture process ----------
 
-def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue):
+def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue, live_queue):
     if camera_type == "usb":
         source_desc = f"USB device {source}"
         frames = usb_frame_generator(source)
@@ -303,6 +324,7 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
     try:
         for frame in frames:
             push_latest(frame_queue, frame)
+            push_latest(live_queue, frame)  # full-res, for on-demand live view — cheap even with no viewer
 
             h, w = frame.shape[:2]
 
@@ -484,6 +506,7 @@ def start_camera(name, cam_type, source, known_encodings, known_ids, profiles, r
     frame_queue = multiprocessing.Queue(maxsize=1)
     boxes_queue = multiprocessing.Queue(maxsize=1)
     out_queue = multiprocessing.Queue(maxsize=1)
+    live_queue = multiprocessing.Queue(maxsize=1)  # full-res frames, for on-demand WebRTC live view
     stop_event = manager.Event()  # Manager-backed — avoids the raw-semaphore rebuild issue on spawn
 
     detector_p = multiprocessing.Process(
@@ -492,22 +515,27 @@ def start_camera(name, cam_type, source, known_encodings, known_ids, profiles, r
     )
     capture_p = multiprocessing.Process(
         target=capture_worker,
-        args=(name, cam_type, source, frame_queue, boxes_queue, out_queue),
+        args=(name, cam_type, source, frame_queue, boxes_queue, out_queue, live_queue),
     )
     detector_p.start()
     capture_p.start()
 
-    registry[name] = {
-        "out_queue": out_queue,
-        "stop_event": stop_event,
-        "detector_p": detector_p,
-        "capture_p": capture_p,
-        "latest": None,
-    }
+    with registry_lock:
+        registry[name] = {
+            "out_queue": out_queue,
+            "live_queue": live_queue,
+            "stop_event": stop_event,
+            "detector_p": detector_p,
+            "capture_p": capture_p,
+            "latest": None,
+            "latest_time": None,
+            "latest_full_frame": None,  # full-res, single-consumer-drained — see main()'s loop
+        }
 
 
 def stop_camera(name, registry):
-    entry = registry.pop(name, None)
+    with registry_lock:
+        entry = registry.pop(name, None)
     if entry is None:
         return
     entry["stop_event"].set()
@@ -515,6 +543,114 @@ def stop_camera(name, registry):
     entry["capture_p"].terminate()
     entry["detector_p"].join()
     entry["capture_p"].join()
+
+
+# ---------- web/live-view layer ----------
+# Reads directly from the same `registry` dict the desktop grid uses —
+# CameraStreamTrack sends the exact same annotated thumbnail (recognition
+# boxes and all) that's already showing in the Tk/cv2 window, no separate
+# capture or frame pipeline needed for the web side.
+
+class CameraStreamTrack(VideoStreamTrack):
+    def __init__(self, camera_name):
+        super().__init__()
+        self._camera_name = camera_name
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+
+        with registry_lock:
+            entry = registry.get(self._camera_name)
+            frame = entry["latest_full_frame"] if entry else None
+
+        if frame is None:
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
+        video_frame.pts = pts
+        video_frame.time_base = time_base
+        return video_frame
+
+
+def is_camera_online(name):
+    with registry_lock:
+        entry = registry.get(name)
+        if entry is None or entry.get("latest_time") is None:
+            return False
+        return (time.time() - entry["latest_time"]) < STALE_AFTER_SEC
+
+
+web_app = FastAPI()
+templates = Jinja2Templates(directory="live_view/templates")
+active_connections = set()
+
+
+@web_app.get("/")
+async def index(request: Request):
+    with registry_lock:
+        names = list(registry.keys())
+    camera_list = [{"name": n, "online": is_camera_online(n)} for n in names]
+    online_count = sum(1 for c in camera_list if c["online"])
+    return templates.TemplateResponse(request, "index.html", {
+        "cameras": camera_list,
+        "online_count": online_count,
+        "total_count": len(camera_list),
+    })
+
+
+@web_app.get("/camera/{name}")
+async def camera_page(request: Request, name: str):
+    with registry_lock:
+        exists = name in registry
+    if not exists:
+        return HTMLResponse(f"No camera named '{name}'", status_code=404)
+    return templates.TemplateResponse(request, "viewer.html", {"camera_name": name})
+
+
+@web_app.websocket("/ws/{name}")
+async def signaling(websocket: WebSocket, name: str):
+    await websocket.accept()
+    with registry_lock:
+        exists = name in registry
+    if not exists:
+        await websocket.close()
+        return
+
+    pc = RTCPeerConnection(configuration=RTC_CONFIG)
+    active_connections.add(pc)
+    pc.addTrack(CameraStreamTrack(name))
+
+    @pc.on("connectionstatechange")
+    async def on_state_change():
+        if pc.connectionState in ("failed", "closed", "disconnected"):
+            await pc.close()
+            active_connections.discard(pc)
+
+    try:
+        raw = await websocket.receive_text()
+        message = json.loads(raw)
+        offer = RTCSessionDescription(sdp=message["sdp"], type=message["type"])
+        await pc.setRemoteDescription(offer)
+
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        await websocket.send_text(json.dumps({
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }))
+
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        print(f"[{name}] Signaling closed: {e}")
+    finally:
+        await pc.close()
+        active_connections.discard(pc)
+
+
+def run_web_server():
+    uvicorn.run(web_app, host=WEB_HOST, port=WEB_PORT, log_level="warning")
 
 
 # ---------- control panel (visible Tk window) ----------
@@ -608,10 +744,12 @@ def main():
     profiles = manager.dict(initial_profiles)
     lock = manager.Lock()
 
-    registry = {}  # camera_name -> {out_queue, stop_event, detector_p, capture_p, latest}
     for cam in INITIAL_CAMERAS:
         start_camera(cam["name"], cam["type"], cam["source"],
                      known_encodings, known_ids, profiles, registry, manager)
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print(f"Live view available at http://<this-machine>:{WEB_PORT}")
 
     root = tk.Tk()
     root.withdraw()  # only used to host Toplevels (control panel + popups)
@@ -654,7 +792,17 @@ def main():
 
             for cam_name in names:
                 try:
-                    registry[cam_name]["latest"] = registry[cam_name]["out_queue"].get_nowait()
+                    latest = registry[cam_name]["out_queue"].get_nowait()
+                    with registry_lock:
+                        registry[cam_name]["latest"] = latest
+                        registry[cam_name]["latest_time"] = time.time()
+                except queue_module.Empty:
+                    pass
+
+                try:
+                    full_frame = registry[cam_name]["live_queue"].get_nowait()
+                    with registry_lock:
+                        registry[cam_name]["latest_full_frame"] = full_frame
                 except queue_module.Empty:
                     pass
 
