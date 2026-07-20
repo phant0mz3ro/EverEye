@@ -87,6 +87,13 @@ STALE_AFTER_SEC = 5  # no new frame in this long = considered offline on the web
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
 
+# How many active WebRTC viewers each camera currently has. main()'s loop
+# only drains the (expensive, full-resolution) live_queue for a camera when
+# this is > 0 — otherwise that unpickling cost was happening every frame
+# for every camera regardless of whether anyone was actually watching.
+viewer_counts = {}
+viewer_counts_lock = threading.Lock()
+
 
 def generate_id():
     return uuid.uuid4().hex[:8]
@@ -620,6 +627,9 @@ async def signaling(websocket: WebSocket, name: str):
     active_connections.add(pc)
     pc.addTrack(CameraStreamTrack(name))
 
+    with viewer_counts_lock:
+        viewer_counts[name] = viewer_counts.get(name, 0) + 1
+
     @pc.on("connectionstatechange")
     async def on_state_change():
         if pc.connectionState in ("failed", "closed", "disconnected"):
@@ -647,6 +657,8 @@ async def signaling(websocket: WebSocket, name: str):
     finally:
         await pc.close()
         active_connections.discard(pc)
+        with viewer_counts_lock:
+            viewer_counts[name] = max(0, viewer_counts.get(name, 1) - 1)
 
 
 def run_web_server():
@@ -799,12 +811,16 @@ def main():
                 except queue_module.Empty:
                     pass
 
-                try:
-                    full_frame = registry[cam_name]["live_queue"].get_nowait()
-                    with registry_lock:
-                        registry[cam_name]["latest_full_frame"] = full_frame
-                except queue_module.Empty:
-                    pass
+                with viewer_counts_lock:
+                    has_viewer = viewer_counts.get(cam_name, 0) > 0
+
+                if has_viewer:
+                    try:
+                        full_frame = registry[cam_name]["live_queue"].get_nowait()
+                        with registry_lock:
+                            registry[cam_name]["latest_full_frame"] = full_frame
+                    except queue_module.Empty:
+                        pass
 
             canvas = np.zeros((rows * THUMB_H, cols * THUMB_W, 3), dtype=np.uint8)
             if n == 0:

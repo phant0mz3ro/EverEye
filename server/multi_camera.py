@@ -26,7 +26,7 @@ import time
 import tkinter as tk
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import cv2
 import face_recognition
@@ -36,8 +36,8 @@ import requests
 import uvicorn
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form, WebSocket
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageTk
 from starlette.requests import Request
@@ -81,6 +81,13 @@ RECORD_FPS = 10  # approximate — actual pull rate varies, this just sets playb
 # in sync, because there isn't a second one.
 registry = {}  # camera_name -> {out_queue, stop_event, detector_p, capture_p, latest, latest_time}
 registry_lock = threading.Lock()
+
+# Same idea as registry — set once by main(), read by the web routes below
+# so /cameras/add can actually spin up a camera, not just view existing ones.
+known_encodings = None
+known_ids = None
+profiles = None
+manager = None
 
 RTC_CONFIG = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
 STALE_AFTER_SEC = 5  # no new frame in this long = considered offline on the web camera list
@@ -602,6 +609,7 @@ async def index(request: Request):
         "cameras": camera_list,
         "online_count": online_count,
         "total_count": len(camera_list),
+        "active_nav": "cameras",
     })
 
 
@@ -611,7 +619,52 @@ async def camera_page(request: Request, name: str):
         exists = name in registry
     if not exists:
         return HTMLResponse(f"No camera named '{name}'", status_code=404)
-    return templates.TemplateResponse(request, "viewer.html", {"camera_name": name})
+    return templates.TemplateResponse(request, "viewer.html", {"camera_name": name, "active_nav": "cameras"})
+
+
+@web_app.get("/manage")
+async def manage_page(request: Request):
+    with registry_lock:
+        names = list(registry.keys())
+    return templates.TemplateResponse(request, "manage.html", {"cameras": names, "error": None, "active_nav": "manage"})
+
+
+@web_app.post("/cameras/add")
+async def add_camera_route(
+    request: Request,
+    name: str = Form(...),
+    cam_type: str = Form(..., alias="type"),
+    source: str = Form(...),
+):
+    with registry_lock:
+        exists = name in registry
+
+    error = None
+    if not name or not source:
+        error = "Name and source are required."
+    elif exists:
+        error = f"A camera named '{name}' already exists."
+    elif cam_type == "usb":
+        try:
+            source = int(source)
+        except ValueError:
+            error = "USB source must be a device index number (e.g. 0)."
+
+    if error is not None:
+        with registry_lock:
+            names = list(registry.keys())
+        return templates.TemplateResponse(
+            request, "manage.html", {"cameras": names, "error": error, "active_nav": "manage"}, status_code=400
+        )
+
+    start_camera(name, cam_type, source, known_encodings, known_ids, profiles, registry, manager)
+    return RedirectResponse(url="/manage", status_code=303)
+
+
+@web_app.post("/cameras/remove")
+async def remove_camera_route(name: str = Form(...)):
+    stop_camera(name, registry)
+    return RedirectResponse(url="/manage", status_code=303)
 
 
 @web_app.websocket("/ws/{name}")
@@ -667,13 +720,11 @@ def run_web_server():
 
 # ---------- control panel (visible Tk window) ----------
 
-def build_control_panel(root, registry, known_encodings, known_ids, profiles, manager):
-    panel = tk.Toplevel(root)
-    panel.title("Camera Control Panel")
-    panel.geometry("300x300")
-
-    tk.Label(panel, text="Active cameras:").pack(anchor="w", padx=10, pady=(10, 0))
-    listbox = tk.Listbox(panel)
+def build_manage_tab(parent, registry, known_encodings, known_ids, profiles, manager):
+    """Populates the 'Manage Cameras' tab — same functionality as the old
+    floating Control Panel window, just embedded in the main app now."""
+    tk.Label(parent, text="Active cameras:").pack(anchor="w", padx=10, pady=(10, 0))
+    listbox = tk.Listbox(parent)
     listbox.pack(padx=10, pady=5, fill="both", expand=True)
 
     def refresh_listbox():
@@ -690,7 +741,7 @@ def build_control_panel(root, registry, known_encodings, known_ids, profiles, ma
         refresh_listbox()
 
     def open_add_form():
-        form = tk.Toplevel(panel)
+        form = tk.Toplevel(parent)
         form.title("Add Camera")
 
         tk.Label(form, text="Name:").pack(anchor="w", padx=10, pady=(10, 0))
@@ -735,8 +786,8 @@ def build_control_panel(root, registry, known_encodings, known_ids, profiles, ma
 
         tk.Button(form, text="Add", command=submit).pack(pady=10)
 
-    tk.Button(panel, text="Add Camera", command=open_add_form).pack(padx=10, pady=(0, 5), fill="x")
-    tk.Button(panel, text="Remove Selected", command=remove_selected).pack(padx=10, pady=(0, 10), fill="x")
+    tk.Button(parent, text="Add Camera", command=open_add_form).pack(padx=10, pady=(0, 5), fill="x")
+    tk.Button(parent, text="Remove Selected", command=remove_selected).pack(padx=10, pady=(0, 10), fill="x")
 
     refresh_listbox()
     return refresh_listbox
@@ -745,6 +796,8 @@ def build_control_panel(root, registry, known_encodings, known_ids, profiles, ma
 # ---------- main process ----------
 
 def main():
+    global known_encodings, known_ids, profiles, manager
+
     multiprocessing.set_start_method("fork")
 
     manager = multiprocessing.Manager()
@@ -764,28 +817,40 @@ def main():
     print(f"Live view available at http://<this-machine>:{WEB_PORT}")
 
     root = tk.Tk()
-    root.withdraw()  # only used to host Toplevels (control panel + popups)
-    build_control_panel(root, registry, known_encodings, known_ids, profiles, manager)
+    root.title("Security Cameras")
+    root.geometry("960x720")
 
-    window_name = "Security Cameras"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # One window, top navigation bar (tabs) instead of separate floating
+    # windows for the video grid and the camera controls.
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
 
-    def on_mouse(event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
+    camera_tab = tk.Frame(notebook, bg="black")
+    manage_tab = tk.Frame(notebook)
+    notebook.add(camera_tab, text="Camera View")
+    notebook.add(manage_tab, text="Manage Cameras")
+
+    # Video grid now renders into a Tkinter Label (as a PIL/ImageTk photo)
+    # instead of a separate cv2.imshow window — this is what lets it live
+    # inside the same app window as the tabs.
+    video_label = tk.Label(camera_tab, bg="black")
+    video_label.pack(fill="both", expand=True)
+
+    # Updated every frame in update_frame(); read back on click. Avoids
+    # recomputing box positions inside the click handler itself.
+    click_state = {"boxes_by_cam": {}, "cols": 1}
+
+    def on_click(event):
         names = list(registry.keys())
-        cols = max(1, math.ceil(math.sqrt(len(names))))
-        col, row = x // THUMB_W, y // THUMB_H
+        cols = click_state["cols"]
+        col, row = event.x // THUMB_W, event.y // THUMB_H
         idx = row * cols + col
         if idx >= len(names):
             return
         cam_name = names[idx]
-        local_x, local_y = x - col * THUMB_W, y - row * THUMB_H
+        local_x, local_y = event.x - col * THUMB_W, event.y - row * THUMB_H
 
-        data = registry.get(cam_name, {}).get("latest")
-        if not data:
-            return
-        for box in data.get("boxes", []):
+        for box in click_state["boxes_by_cam"].get(cam_name, []):
             if box["x1"] <= local_x <= box["x2"] and box["y1"] <= local_y <= box["y2"]:
                 if box["id"] is None:
                     open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock)
@@ -793,59 +858,81 @@ def main():
                     open_known_popup(root, box, profiles, lock)
                 break
 
-    cv2.setMouseCallback(window_name, on_mouse)
+    video_label.bind("<Button-1>", on_click)
 
-    try:
-        while True:
-            names = list(registry.keys())
-            n = len(names)
-            cols = max(1, math.ceil(math.sqrt(n))) if n else 1
-            rows = max(1, math.ceil(n / cols)) if n else 1
+    build_manage_tab(manage_tab, registry, known_encodings, known_ids, profiles, manager)
 
-            for cam_name in names:
+    canvas_holder = {"canvas": None, "shape": None}
+    photo_holder = {"image": None}  # must keep a reference — Tkinter drops PhotoImages with no live reference
+
+    def update_frame():
+        names = list(registry.keys())
+        n = len(names)
+        cols = max(1, math.ceil(math.sqrt(n))) if n else 1
+        rows = max(1, math.ceil(n / cols)) if n else 1
+        click_state["cols"] = cols
+
+        for cam_name in names:
+            try:
+                latest = registry[cam_name]["out_queue"].get_nowait()
+                with registry_lock:
+                    registry[cam_name]["latest"] = latest
+                    registry[cam_name]["latest_time"] = time.time()
+            except queue_module.Empty:
+                pass
+
+            data = registry[cam_name]["latest"]
+            click_state["boxes_by_cam"][cam_name] = data["boxes"] if data else []
+
+            with viewer_counts_lock:
+                has_viewer = viewer_counts.get(cam_name, 0) > 0
+
+            if has_viewer:
                 try:
-                    latest = registry[cam_name]["out_queue"].get_nowait()
+                    full_frame = registry[cam_name]["live_queue"].get_nowait()
                     with registry_lock:
-                        registry[cam_name]["latest"] = latest
-                        registry[cam_name]["latest_time"] = time.time()
+                        registry[cam_name]["latest_full_frame"] = full_frame
                 except queue_module.Empty:
                     pass
 
-                with viewer_counts_lock:
-                    has_viewer = viewer_counts.get(cam_name, 0) > 0
+        shape = (rows * THUMB_H, cols * THUMB_W, 3)
+        if canvas_holder["canvas"] is None or canvas_holder["shape"] != shape:
+            canvas_holder["canvas"] = np.zeros(shape, dtype=np.uint8)
+            canvas_holder["shape"] = shape
+        canvas = canvas_holder["canvas"]
 
-                if has_viewer:
-                    try:
-                        full_frame = registry[cam_name]["live_queue"].get_nowait()
-                        with registry_lock:
-                            registry[cam_name]["latest_full_frame"] = full_frame
-                    except queue_module.Empty:
-                        pass
+        if n == 0:
+            canvas[:] = 0
+            cv2.putText(canvas, "No cameras — use the Manage Cameras tab to add one",
+                        (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        for idx, cam_name in enumerate(names):
+            row, col = divmod(idx, cols)
+            y0, x0 = row * THUMB_H, col * THUMB_W
+            data = registry[cam_name]["latest"]
+            if data is not None:
+                canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data["frame"]
+            else:
+                cv2.putText(canvas, f"{cam_name}: connecting...",
+                            (x0 + 20, y0 + THUMB_H // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-            canvas = np.zeros((rows * THUMB_H, cols * THUMB_W, 3), dtype=np.uint8)
-            if n == 0:
-                cv2.putText(canvas, "No cameras — use the control panel to add one",
-                            (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-            for idx, cam_name in enumerate(names):
-                row, col = divmod(idx, cols)
-                y0, x0 = row * THUMB_H, col * THUMB_W
-                data = registry[cam_name]["latest"]
-                if data is not None:
-                    canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data["frame"]
-                else:
-                    cv2.putText(canvas, f"{cam_name}: connecting...",
-                                (x0 + 20, y0 + THUMB_H // 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        # cv2 works in BGR; Tkinter/PIL expect RGB
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        photo_holder["image"] = photo
+        video_label.configure(image=photo)
 
-            cv2.imshow(window_name, canvas)
-            root.update()
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    finally:
-        cv2.destroyAllWindows()
+        root.after(30, update_frame)  # ~33fps grid refresh; reschedules itself, replaces the old while-True loop
+
+    update_frame()
+
+    def on_close():
         for cam_name in list(registry.keys()):
             stop_camera(cam_name, registry)
         root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
 
 
 if __name__ == "__main__":
