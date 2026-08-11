@@ -1,51 +1,60 @@
 """
-Multi-camera security system.
+Multi-camera security system — PI 3 / 1GB RAM TIER.
 
-Architecture per camera: TWO processes — capture_worker (lightweight,
-pulls frames, records, builds thumbnails) and detector_worker (CPU-heavy
-motion+face detection/recognition, isolated on its own core so it never
-stalls capture or display).
+This is a deliberately lighter branch of the main codebase, built for
+Raspberry Pi 3 hardware. Cuts made relative to the full version:
 
-Desktop UI: one Tkinter window, ttk.Notebook top nav with "Camera View"
-and "Manage Cameras" tabs. Video renders into a Tkinter Label (not a
-separate cv2 window) so everything lives in one app instance.
+  - NO face recognition (dlib/face_recognition dropped entirely — it's
+    the single heaviest thing in the original stack, both to build and
+    to run on a Cortex-A53). This tier is motion-alert only, no identity.
+  - NO mediapipe face detection either — replaced with plain OpenCV
+    frame-differencing motion detection (detect_motion, already existed
+    in the original file, just wasn't wired to anything executable).
+  - Motion detection folded directly into each camera's own capture
+    process, using cheap OpenCV frame-differencing instead of mediapipe
+    or dlib. The original file's "one detector process per camera" was
+    actually dead code already (never started, never wired up) — this
+    makes real what was aspirational, rather than adding a second
+    process type back in. Net result: one process per camera, same as
+    what was actually running before, just with working motion alerts.
+  - NO WebRTC/aiortc for the web view — aiortc pulls in native codec
+    deps that are painful to build on ARM and does its own software
+    video encode in the background. Replaced with plain MJPEG streaming
+    (motion JPEG over HTTP), which is what most cheap IP cameras use
+    anyway and costs far less CPU.
+  - Recording only writes while motion is active (not continuously),
+    to cut disk I/O and encode load.
+  - Slower GUI refresh and detection cadence — tuned for A53, not a
+    desktop CPU.
+
+Desktop UI: one Tkinter window, ttk.Notebook top nav with "Camera View",
+"Manage Cameras", and "WiFi Setup" tabs. Video renders into a Tkinter
+Label (not a separate cv2 window).
 
 Clicking a camera tile in the grid goes fullscreen (full-resolution,
 single camera); clicking anywhere while fullscreen returns to the grid.
-Clicking a face box (grid or nowhere-near-fullscreen) still opens the
-known/unknown recognition popups as before.
 
-Web app: FastAPI + WebRTC (aiortc) live view, reachable from other
-devices, with its own camera list / per-camera viewer / manage pages —
-runs as a background thread inside this same process.
-
-Known faces / profiles are shared across all detector processes via
-multiprocessing.Manager, and across desktop + web via a shared registry.
+Web app: FastAPI + MJPEG live view, reachable from other devices, runs
+as a background thread inside this same process.
 """
 
 import json
 import math
 import multiprocessing
 import os
-import pickle
 import queue as queue_module
 import threading
 import time
 import tkinter as tk
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 import cv2
-#import face_recognition
-import mediapipe as mp
 import numpy as np
 import requests
 import uvicorn
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from av import VideoFrame
-from fastapi import FastAPI, Form, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Form
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageTk
 from starlette.requests import Request
@@ -61,52 +70,30 @@ INITIAL_CAMERAS = [
     {"name": "usb_test",   "type": "usb",  "source": 0},
 ]
 
-FACE_SAVE_DIR = "detected_faces"
-KNOWN_FACES_DIR = "known_faces"
-SAVE_COOLDOWN_SEC = 2.0
-CROP_PADDING = 0.3
-
 MOTION_THRESHOLD = 25
 MOTION_MIN_AREA = 2000
-
-ENCODINGS_FILE = "encodings.pkl"
-PROFILES_FILE = "profiles.json"
-RECOGNITION_TOLERANCE = 0.6
-
-BOX_PERSIST_SEC = 4.0
-DETECTION_INTERVAL_SEC = 0.5  # detector won't re-run more often than this
-PROCESS_SCALE = 0.5           # detection/encoding runs on a half-size frame
+MOTION_SCALE = 0.4              # motion diffing runs on a downscaled frame — cheap on A53
+DETECTION_INTERVAL_SEC = 1.5    # motion check cadence — original was 0.5s, too tight for a Pi 3
+MOTION_ACTIVE_HOLD_SEC = 8.0    # keep "motion active" (and recording) this long after last trigger
 
 THUMB_W = 320
 THUMB_H = 240
 
 RECORDINGS_DIR = "recordings"
-RECORDING_SEGMENT_SEC = 30 * 60  # new file every 30 minutes
-RECORD_FPS = 10  # approximate — actual pull rate varies, this just sets playback speed metadata
+RECORDING_SEGMENT_SEC = 30 * 60  # new file every 30 minutes, while motion-active
+RECORD_FPS = 8                    # fps for "motion" recording mode
+RECORD_FPS_CONTINUOUS = 4         # fps for "continuous" mode — kept low, it's running all the time
 
-RTC_CONFIG = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
-STALE_AFTER_SEC = 5  # no new frame in this long = considered offline on the web camera list
+GUI_REFRESH_MS = 120   # was 30ms (~33fps) — a security grid doesn't need that; ~8fps is plenty
+STALE_AFTER_SEC = 5    # no new frame in this long = considered offline on the web camera list
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
+MJPEG_QUALITY = 70     # JPEG quality for the web stream — lower = less CPU/bandwidth
 
-# How many active WebRTC viewers each camera currently has. The render
-# loop only drains the (expensive, full-resolution) live_queue for a
-# camera when this is > 0 OR the desktop app has it fullscreen — otherwise
-# that unpickling cost was happening every frame for every camera
-# regardless of whether anyone was actually watching.
-viewer_counts = {}
-viewer_counts_lock = threading.Lock()
-
-registry = {}  # camera_name -> {out_queue, live_queue, stop_event, detector_p, capture_p, latest, latest_time, latest_full_frame}
+registry = {}  # camera_name -> {out_queue, live_queue, capture_p, latest, latest_time, latest_full_frame, motion}
 registry_lock = threading.Lock()
 
-# Same idea as registry — set once by main(), read by the web routes and
-# desktop UI so camera add/remove works from anywhere, not just main()'s
-# own local scope.
-known_encodings = None
-known_ids = None
 profiles = None
-manager = None
 
 
 def generate_id():
@@ -115,19 +102,7 @@ def generate_id():
 
 # ---------- disk persistence ----------
 
-def load_known_faces_from_disk():
-    if not os.path.exists(ENCODINGS_FILE):
-        print(f"No {ENCODINGS_FILE} found — run encode_known_faces.py first, "
-              f"or enroll people live via the Unknown popup.")
-        return [], []
-    with open(ENCODINGS_FILE, "rb") as f:
-        data = pickle.load(f)
-    return data["encodings"], data["ids"]
-
-
-def save_known_faces_to_disk(known_encodings_, known_ids_):
-    with open(ENCODINGS_FILE, "wb") as f:
-        pickle.dump({"encodings": list(known_encodings_), "ids": list(known_ids_)}, f)
+PROFILES_FILE = "profiles.json"
 
 
 def load_profiles_from_disk():
@@ -142,13 +117,39 @@ def save_profiles_to_disk(profiles_):
         json.dump(dict(profiles_), f, indent=2)
 
 
-def get_reference_photo(person_id):
-    person_dir = os.path.join(KNOWN_FACES_DIR, person_id)
-    if not os.path.isdir(person_dir):
-        return None
-    for filename in sorted(os.listdir(person_dir)):
-        return os.path.join(person_dir, filename)
-    return None
+SETTINGS_FILE = "settings.json"
+DEFAULT_SETTINGS = {"recording_mode": "motion"}  # "motion" or "continuous"
+
+_settings_cache = {"mtime": None, "data": dict(DEFAULT_SETTINGS)}
+
+
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return dict(DEFAULT_SETTINGS)
+    with open(SETTINGS_FILE, "r") as f:
+        data = json.load(f)
+    return {**DEFAULT_SETTINGS, **data}
+
+
+def save_settings(settings_):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings_, f, indent=2)
+
+
+def get_recording_mode():
+    """
+    Re-reads settings.json only when its mtime changes — cheap enough to
+    call every frame from a capture process, and picks up a change made
+    in the Settings tab within a second or two without restarting cameras.
+    """
+    try:
+        mtime = os.path.getmtime(SETTINGS_FILE)
+    except OSError:
+        return DEFAULT_SETTINGS["recording_mode"]
+    if mtime != _settings_cache["mtime"]:
+        _settings_cache["mtime"] = mtime
+        _settings_cache["data"] = load_settings()
+    return _settings_cache["data"].get("recording_mode", DEFAULT_SETTINGS["recording_mode"])
 
 
 # ---------- frame sources ----------
@@ -203,132 +204,24 @@ def push_latest(q, item):
         pass
 
 
-def open_new_segment(camera_name, frame_w, frame_h):
+def open_new_segment(camera_name, frame_w, frame_h, fps):
     cam_dir = os.path.join(RECORDINGS_DIR, camera_name)
     os.makedirs(cam_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filepath = os.path.join(cam_dir, f"{timestamp}.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(filepath, fourcc, RECORD_FPS, (frame_w, frame_h))
+    writer = cv2.VideoWriter(filepath, fourcc, fps, (frame_w, frame_h))
     print(f"[{camera_name}] Recording new segment: {filepath}")
     return writer
 
 
-# ---------- detector process ----------
-"""
-def detector_worker(camera_name, known_encodings_, known_ids_, profiles_, frame_queue, boxes_queue, stop_event):
-    os.makedirs(FACE_SAVE_DIR, exist_ok=True)
-    save_executor = ThreadPoolExecutor(max_workers=1)
-
-    mp_face_detection = mp.solutions.face_detection
-    prev_gray = None
-    last_detection_time = 0.0
-
-    with mp_face_detection.FaceDetection(
-        model_selection=0,
-        min_detection_confidence=0.6,
-    ) as detector:
-        while not stop_event.is_set():
-            try:
-                frame = frame_queue.get(timeout=0.2)
-            except queue_module.Empty:
-                continue
-
-            now = time.time()
-            if now - last_detection_time < DETECTION_INTERVAL_SEC:
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
-            motion = False
-            if prev_gray is not None:
-                motion = detect_motion(prev_gray, gray_blurred)
-            prev_gray = gray_blurred
-
-            if not motion:
-                continue
-
-            last_detection_time = now
-
-            small = cv2.resize(frame, None, fx=PROCESS_SCALE, fy=PROCESS_SCALE)
-            rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            results = detector.process(rgb_small)
-            sh, sw = small.shape[:2]
-            h, w = frame.shape[:2]
-            new_boxes = []
-
-            local_encodings = list(known_encodings_)
-            local_ids = list(known_ids_)
-            local_profiles = dict(profiles_)
-
-            if results.detections:
-                for detection in results.detections:
-                    box = detection.location_data.relative_bounding_box
-                    x1 = max(int(box.xmin * w), 0)
-                    y1 = max(int(box.ymin * h), 0)
-                    bw = int(box.width * w)
-                    bh = int(box.height * h)
-                    x2, y2 = min(x1 + bw, w), min(y1 + bh, h)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-
-                    sx1 = max(int(box.xmin * sw), 0)
-                    sy1 = max(int(box.ymin * sh), 0)
-                    sbw = int(box.width * sw)
-                    sbh = int(box.height * sh)
-                    sx2, sy2 = min(sx1 + sbw, sw), min(sy1 + sbh, sh)
-
-                    face_location = [(sy1, sx2, sy2, sx1)]
-                    person_id = None
-                    display_name = "Unknown"
-                    confidence = None
-
-                    
-                    encodings = face_recognition.face_encodings(
-                        rgb_small, known_face_locations=face_location)
-
-                    
-
-                    if encodings and local_encodings:
-                        distances = face_recognition.face_distance(local_encodings, encodings[0])
-                        best_match_idx = int(np.argmin(distances))
-                        best_distance = distances[best_match_idx]
-                        if best_distance <= RECOGNITION_TOLERANCE:
-                            person_id = local_ids[best_match_idx]
-                            display_name = local_profiles.get(person_id, {}).get("name", person_id)
-                            confidence = round(max(0.0, 1.0 - best_distance) * 100)
-                    
-                    pad_x = int(bw * CROP_PADDING)
-                    pad_y = int(bh * CROP_PADDING)
-                    cx1 = max(x1 - pad_x, 0)
-                    cy1 = max(y1 - pad_y, 0)
-                    cx2 = min(x2 + pad_x, w)
-                    cy2 = min(y2 + pad_y, h)
-                    crop = frame[cy1:cy2, cx1:cx2].copy()
-
-                    new_boxes.append({
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "id": person_id, "name": display_name, "confidence": confidence,
-                        "crop": crop,
-                    })
-
-                    safe_name = display_name.replace(" ", "_")
-                    id_tag = person_id or "unknown"
-                    filename = os.path.join(
-                        FACE_SAVE_DIR, f"{camera_name}_{safe_name}_{id_tag}_{int(now * 1000)}.jpg"
-                    )
-                    save_executor.submit(cv2.imwrite, filename, crop)
-                    print(f"[{camera_name}] Saving: {filename}")
-
-            if new_boxes:
-                push_latest(boxes_queue, new_boxes)
-
-    save_executor.shutdown(wait=False)
-"""
-
 # ---------- capture process ----------
+# One process per camera: pulls frames, does cheap motion-diff (no
+# mediapipe/dlib), records only while motion is active, builds the
+# thumbnail for the desktop grid. This is the ENTIRE per-camera process
+# now — there is no separate detector process on this tier.
 
-def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, out_queue, live_queue):
+def capture_worker(camera_name, camera_type, source, out_queue, live_queue):
     if camera_type == "usb":
         source_desc = f"USB device {source}"
         frames = usb_frame_generator(source)
@@ -336,55 +229,57 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
         source_desc = source
         frames = frame_generator(source)
 
-    last_boxes = []
-    last_boxes_time = 0.0
     writer = None
+    writer_fps = None
     segment_start_time = 0.0
+    prev_gray = None
+    last_motion_check = 0.0
+    last_motion_time = 0.0  # last time motion was actually seen
 
     print(f"[{camera_name}] Connecting to {source_desc} ...")
     try:
         for frame in frames:
-            push_latest(frame_queue, frame)
             push_latest(live_queue, frame)  # full-res, for on-demand live view — cheap even with no viewer
 
             h, w = frame.shape[:2]
-
             now = time.time()
-            if writer is None or (now - segment_start_time) >= RECORDING_SEGMENT_SEC:
-                if writer is not None:
-                    writer.release()
-                writer = open_new_segment(camera_name, w, h)
-                segment_start_time = now
-            writer.write(frame)
 
-            try:
-                last_boxes = boxes_queue.get_nowait()
-                last_boxes_time = time.time()
-            except queue_module.Empty:
-                pass
+            # cheap motion check — downscaled grayscale diff, not every frame
+            if now - last_motion_check >= DETECTION_INTERVAL_SEC:
+                last_motion_check = now
+                small = cv2.resize(frame, None, fx=MOTION_SCALE, fy=MOTION_SCALE)
+                gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+                if prev_gray is not None and detect_motion(prev_gray, gray):
+                    last_motion_time = now
+                prev_gray = gray
 
-            scale_x, scale_y = THUMB_W / w, THUMB_H / h
+            motion_active = (now - last_motion_time) < MOTION_ACTIVE_HOLD_SEC
+            mode = get_recording_mode()
+            should_record = motion_active if mode == "motion" else True
+            fps = RECORD_FPS if mode == "motion" else RECORD_FPS_CONTINUOUS
+
+            # "motion" mode: record only while motion is (recently) active —
+            # cuts disk I/O and encode load to a fraction of continuous.
+            # "continuous" mode: always recording, at a lower fps to keep
+            # the encode load manageable on a Pi 3.
+            if should_record:
+                if writer is None or (now - segment_start_time) >= RECORDING_SEGMENT_SEC or writer_fps != fps:
+                    if writer is not None:
+                        writer.release()
+                    writer = open_new_segment(camera_name, w, h, fps)
+                    writer_fps = fps
+                    segment_start_time = now
+                writer.write(frame)
+            elif writer is not None:
+                writer.release()
+                writer = None
+
             thumb = cv2.resize(frame, (THUMB_W, THUMB_H))
+            if motion_active:
+                cv2.rectangle(thumb, (0, 0), (THUMB_W - 1, THUMB_H - 1), (0, 0, 255), 4)
+                cv2.putText(thumb, "MOTION", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            thumb_boxes = []
-            if last_boxes and (time.time() - last_boxes_time) < BOX_PERSIST_SEC:
-                for b in last_boxes:
-                    tx1, ty1 = int(b["x1"] * scale_x), int(b["y1"] * scale_y)
-                    tx2, ty2 = int(b["x2"] * scale_x), int(b["y2"] * scale_y)
-                    color = (0, 255, 0) if b["id"] is not None else (0, 0, 255)
-                    label = b["name"]
-                    if b["confidence"] is not None:
-                        label = f"{label} {b['confidence']}%"
-                    cv2.rectangle(thumb, (tx1, ty1), (tx2, ty2), color, 2)
-                    cv2.putText(thumb, label, (tx1, max(ty1 - 8, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-                    thumb_boxes.append({
-                        "x1": tx1, "y1": ty1, "x2": tx2, "y2": ty2,
-                        "id": b["id"], "name": b["name"], "confidence": b["confidence"],
-                        "crop": b["crop"],
-                    })
-
-            push_latest(out_queue, {"frame": thumb, "boxes": thumb_boxes})
+            push_latest(out_queue, {"frame": thumb, "motion": motion_active})
     except Exception as e:
         print(f"[{camera_name}] Stopped: {e}")
     finally:
@@ -392,162 +287,27 @@ def capture_worker(camera_name, camera_type, source, frame_queue, boxes_queue, o
             writer.release()
 
 
-# ---------- popup UI (desktop, main process only) ----------
-
-def open_known_popup(root, box, profiles_, lock):
-    person_id = box["id"]
-    profile = dict(profiles_.get(person_id, {"name": box["name"], "age": ""}))
-
-    win = tk.Toplevel(root)
-    win.title(profile.get("name", person_id))
-    win.resizable(True, True)
-
-    ref_path = get_reference_photo(person_id)
-    if ref_path and os.path.exists(ref_path):
-        img = Image.open(ref_path)
-        img.thumbnail((200, 200))
-        photo = ImageTk.PhotoImage(img)
-        img_label = tk.Label(win, image=photo)
-        img_label.image = photo
-        img_label.pack(padx=10, pady=10)
-
-    tk.Label(win, text=f"ID: {person_id}", fg="gray").pack()
-    if box["confidence"] is not None:
-        tk.Label(win, text=f"Match confidence: {box['confidence']}%", fg="gray").pack(pady=(0, 10))
-
-    fields_frame = tk.Frame(win)
-    fields_frame.pack(padx=10, pady=5, fill="both", expand=True)
-
-    field_rows = []
-
-    def add_row(key, value):
-        row = tk.Frame(fields_frame)
-        row.pack(fill="x", pady=2)
-        tk.Label(row, text=f"{key}:", width=10, anchor="w").pack(side="left")
-        entry = tk.Entry(row)
-        entry.insert(0, value)
-        entry.pack(side="left", fill="x", expand=True)
-        field_rows.append((key, entry))
-
-    add_row("name", profile.get("name", ""))
-    add_row("age", profile.get("age", ""))
-    for key, value in profile.items():
-        if key not in ("name", "age"):
-            add_row(key, value)
-
-    add_field_frame = tk.Frame(win)
-    add_field_frame.pack(padx=10, pady=(5, 0), fill="x")
-    tk.Label(add_field_frame, text="New field:").pack(side="left")
-    new_key_entry = tk.Entry(add_field_frame, width=10)
-    new_key_entry.pack(side="left", padx=(5, 2))
-    new_val_entry = tk.Entry(add_field_frame, width=12)
-    new_val_entry.pack(side="left", padx=2)
-
-    def add_new_field():
-        key = new_key_entry.get().strip()
-        if not key:
-            return
-        add_row(key, new_val_entry.get().strip())
-        new_key_entry.delete(0, "end")
-        new_val_entry.delete(0, "end")
-
-    tk.Button(add_field_frame, text="+", command=add_new_field).pack(side="left", padx=2)
-
-    def save_profile():
-        updated = {key: entry.get().strip() for key, entry in field_rows}
-        with lock:
-            profiles_[person_id] = updated
-            save_profiles_to_disk(profiles_)
-        win.destroy()
-
-    tk.Button(win, text="Save", command=save_profile).pack(pady=10)
-
-"""
-def open_unknown_popup(root, box, known_encodings_, known_ids_, profiles_, lock):
-    win = tk.Toplevel(root)
-    win.title("Unknown — Enroll")
-    win.resizable(True, True)
-
-    crop_rgb = cv2.cvtColor(box["crop"], cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(crop_rgb)
-    img.thumbnail((200, 200))
-    photo = ImageTk.PhotoImage(img)
-    img_label = tk.Label(win, image=photo)
-    img_label.image = photo
-    img_label.pack(padx=10, pady=10)
-
-    tk.Label(win, text="Name:").pack(anchor="w", padx=10)
-    name_entry = tk.Entry(win, width=30)
-    name_entry.pack(padx=10, pady=(0, 5))
-
-    tk.Label(win, text="Age:").pack(anchor="w", padx=10)
-    age_entry = tk.Entry(win, width=30)
-    age_entry.pack(padx=10, pady=(0, 10))
-
-    status_label = tk.Label(win, text="", fg="red")
-    status_label.pack()
-
-    def enroll():
-        new_name = name_entry.get().strip()
-        if not new_name:
-            status_label.config(text="Enter a name first")
-            return
-
-        encodings = face_recognition.face_encodings(crop_rgb)
-        if not encodings:
-            status_label.config(text="Couldn't encode this face — try a clearer capture")
-            return
-
-        person_id = generate_id()
-        person_dir = os.path.join(KNOWN_FACES_DIR, person_id)
-        os.makedirs(person_dir, exist_ok=True)
-        photo_path = os.path.join(person_dir, f"{int(time.time())}.jpg")
-        cv2.imwrite(photo_path, box["crop"])
-
-        with lock:
-            known_encodings_.append(encodings[0])
-            known_ids_.append(person_id)
-            save_known_faces_to_disk(known_encodings_, known_ids_)
-
-            profiles_[person_id] = {"name": new_name, "age": age_entry.get().strip()}
-            save_profiles_to_disk(profiles_)
-
-        print(f"Enrolled new person: {new_name} (id={person_id}, visible to all cameras)")
-        win.destroy()
-
-    tk.Button(win, text="Enroll as known", command=enroll).pack(pady=(0, 10))
-
-"""
 # ---------- camera lifecycle (add/remove live, from desktop OR web) ----------
 
-def start_camera(name, cam_type, source, known_encodings_, known_ids_, profiles_, registry_, manager_):
-    frame_queue = multiprocessing.Queue(maxsize=1)
-    boxes_queue = multiprocessing.Queue(maxsize=1)
+def start_camera(name, cam_type, source, registry_):
     out_queue = multiprocessing.Queue(maxsize=1)
     live_queue = multiprocessing.Queue(maxsize=1)
-    stop_event = manager_.Event()  # Manager-backed — avoids the raw-semaphore rebuild issue on spawn/fork edge cases
 
-    """detector_p = multiprocessing.Process(
-        target=detector_worker,
-        args=(name, known_encodings_, known_ids_, profiles_, frame_queue, boxes_queue, stop_event),
-    )"""
     capture_p = multiprocessing.Process(
         target=capture_worker,
-        args=(name, cam_type, source, frame_queue, boxes_queue, out_queue, live_queue),
+        args=(name, cam_type, source, out_queue, live_queue),
     )
-    #detector_p.start()
     capture_p.start()
 
     with registry_lock:
         registry_[name] = {
             "out_queue": out_queue,
             "live_queue": live_queue,
-            "stop_event": stop_event,
-            #"detector_p": detector_p,
             "capture_p": capture_p,
             "latest": None,
             "latest_time": None,
             "latest_full_frame": None,
+            "motion": False,
         }
 
 
@@ -556,39 +316,35 @@ def stop_camera(name, registry_):
         entry = registry_.pop(name, None)
     if entry is None:
         return
-    entry["stop_event"].set()
-    #entry["detector_p"].terminate()
     entry["capture_p"].terminate()
-    #entry["detector_p"].join()
     entry["capture_p"].join()
 
 
-# ---------- web app (FastAPI + WebRTC) ----------
+# ---------- web app (FastAPI + MJPEG) ----------
 
 web_app = FastAPI()
 templates = Jinja2Templates(directory="live_view/templates")
-active_connections = set()
 
 
-class CameraStreamTrack(VideoStreamTrack):
-    def __init__(self, camera_name):
-        super().__init__()
-        self._camera_name = camera_name
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-
+def _mjpeg_frame_bytes(camera_name):
+    """Generator yielding one multipart-JPEG chunk per frame for a camera's stream."""
+    boundary = b"--frame"
+    while True:
         with registry_lock:
-            entry = registry.get(self._camera_name)
+            entry = registry.get(camera_name)
             frame = entry["latest_full_frame"] if entry else None
-
         if frame is None:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-
-        video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
+            time.sleep(0.1)
+            continue
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, MJPEG_QUALITY])
+        if not ok:
+            time.sleep(0.1)
+            continue
+        yield (
+            boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + str(len(jpg)).encode() + b"\r\n\r\n" + jpg.tobytes() + b"\r\n"
+        )
+        time.sleep(1.0 / 12)  # ~12fps cap on the web stream — plenty for a live view, cheap to encode
 
 
 @web_app.get("/")
@@ -612,6 +368,13 @@ async def index(request: Request):
 @web_app.get("/camera/{name}")
 async def camera_page(request: Request, name: str):
     return templates.TemplateResponse(request, "viewer.html", {"camera_name": name, "active_nav": "cameras"})
+
+
+@web_app.get("/stream/{name}")
+async def stream_camera(name: str):
+    return StreamingResponse(
+        _mjpeg_frame_bytes(name), media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 
 @web_app.get("/manage")
@@ -649,7 +412,7 @@ async def add_camera_route(
             request, "manage.html", {"cameras": names, "error": error, "active_nav": "manage"}, status_code=400
         )
 
-    start_camera(name, cam_type, source, known_encodings, known_ids, profiles, registry, manager)
+    start_camera(name, cam_type, source, registry)
     return RedirectResponse(url="/manage", status_code=303)
 
 
@@ -659,57 +422,15 @@ async def remove_camera_route(name: str = Form(...)):
     return RedirectResponse(url="/manage", status_code=303)
 
 
-@web_app.websocket("/ws/{name}")
-async def signaling(websocket: WebSocket, name: str):
-    await websocket.accept()
-    pc = RTCPeerConnection(configuration=RTC_CONFIG)
-    active_connections.add(pc)
-    pc.addTrack(CameraStreamTrack(name))
-
-    with viewer_counts_lock:
-        viewer_counts[name] = viewer_counts.get(name, 0) + 1
-
-    @pc.on("connectionstatechange")
-    async def on_state_change():
-        print(f"Connection state: {pc.connectionState}")
-        if pc.connectionState in ("failed", "closed", "disconnected"):
-            await pc.close()
-            active_connections.discard(pc)
-
-    try:
-        raw = await websocket.receive_text()
-        message = json.loads(raw)
-        offer = RTCSessionDescription(sdp=message["sdp"], type=message["type"])
-        await pc.setRemoteDescription(offer)
-
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-
-        await websocket.send_text(json.dumps({
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type,
-        }))
-
-        while True:
-            await websocket.receive_text()
-    except Exception as e:
-        print(f"[{name}] Signaling closed: {e}")
-    finally:
-        await pc.close()
-        active_connections.discard(pc)
-        with viewer_counts_lock:
-            viewer_counts[name] = max(0, viewer_counts.get(name, 1) - 1)
-
-
 def run_web_server():
     uvicorn.run(web_app, host=WEB_HOST, port=WEB_PORT, log_level="warning")
 
 
 # ---------- desktop: Manage Cameras tab ----------
 
-def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_, manager_):
+def build_manage_tab(parent, registry_, profiles_):
     tk.Label(parent, text="Active Cameras", font=("Arial", 11, "bold")).pack(anchor="w", padx=16, pady=(16, 6))
-    listbox = tk.Listbox(parent, height=8)
+    listbox = tk.Listbox(parent, height=8, exportselection=False)
     listbox.pack(padx=16, pady=(0, 10), fill="x")
 
     last_shown_names = {"names": None}
@@ -787,7 +508,7 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
                 status_label.config(text="USB source must be a device index number (e.g. 0)")
                 return
 
-        start_camera(name, cam_type, source, known_encodings_, known_ids_, profiles_, registry_, manager_)
+        start_camera(name, cam_type, source, registry_)
         status_label.config(text="")
         name_entry.delete(0, "end")
         source_entry.delete(0, "end")
@@ -797,7 +518,7 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
 
     # --- Camera Discovery ---
     import threading
-    from discover_cameras import discover_cameras
+    from discover_cameras import discover_cameras, discover_usb_cameras
 
     tk.Label(parent, text="Discover Cameras", font=("Arial", 11, "bold")).pack(anchor="w", padx=16, pady=(20, 6))
 
@@ -807,13 +528,14 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
     scan_status_label = tk.Label(discovery_frame, text="", fg="gray")
     scan_status_label.pack(anchor="w")
 
-    discovery_listbox = tk.Listbox(parent, height=5)
+    discovery_listbox = tk.Listbox(parent, height=5, exportselection=False)
     discovery_listbox.pack(padx=16, pady=(0, 6), fill="x")
 
     found_cameras = {"results": []}  # index -> camera dict, kept in sync with listbox rows
 
     def run_scan():
         scan_btn.config(state="disabled", text="Scanning...")
+        usb_scan_btn.config(state="disabled")
         scan_status_label.config(text="Scanning local network, this can take a few seconds...")
         discovery_listbox.delete(0, "end")
         found_cameras["results"] = []
@@ -825,13 +547,41 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
                 discovery_listbox.delete(0, "end")
                 found_cameras["results"] = results
                 if not results:
-                    scan_status_label.config(text="No cameras found on the network.")
+                    scan_status_label.config(text="No network cameras found.")
                 else:
                     scan_status_label.config(text=f"Found {len(results)} camera(s). Select one, then click 'Use Selected'.")
                     for cam in results:
                         label = f"{cam['protocol'].upper()}  {cam['ip']}:{cam['port']}{cam['stream_path'] or ''}"
                         discovery_listbox.insert("end", label)
-                scan_btn.config(state="normal", text="Scan for Cameras")
+                scan_btn.config(state="normal", text="Scan Network")
+                usb_scan_btn.config(state="normal")
+
+            parent.after(0, update_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_usb_scan():
+        scan_btn.config(state="disabled")
+        usb_scan_btn.config(state="disabled", text="Scanning...")
+        scan_status_label.config(text="Checking /dev/video* devices...")
+        discovery_listbox.delete(0, "end")
+        found_cameras["results"] = []
+
+        def worker():
+            results = discover_usb_cameras()
+
+            def update_ui():
+                discovery_listbox.delete(0, "end")
+                found_cameras["results"] = results
+                if not results:
+                    scan_status_label.config(text="No USB cameras found.")
+                else:
+                    scan_status_label.config(text=f"Found {len(results)} USB camera(s). Select one, then click 'Use Selected'.")
+                    for cam in results:
+                        label = f"USB  {cam['name']} (index {cam['index']})"
+                        discovery_listbox.insert("end", label)
+                scan_btn.config(state="normal")
+                usb_scan_btn.config(state="normal", text="Scan USB")
 
             parent.after(0, update_ui)
 
@@ -844,7 +594,11 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
             return
         cam = found_cameras["results"][selection[0]]
 
-        if cam["protocol"] == "mjpeg":
+        if cam["protocol"] == "usb":
+            type_var.set("usb")
+            source_entry.delete(0, "end")
+            source_entry.insert(0, str(cam["index"]))
+        elif cam["protocol"] == "mjpeg":
             type_var.set("http")
             source_entry.delete(0, "end")
             source_entry.insert(0, f"http://{cam['ip']}:{cam['port']}{cam['stream_path']}")
@@ -858,32 +612,237 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
 
     btn_row = tk.Frame(discovery_frame)
     btn_row.pack(anchor="w", pady=(4, 0))
-    scan_btn = tk.Button(btn_row, text="Scan for Cameras", command=run_scan)
+    scan_btn = tk.Button(btn_row, text="Scan Network", command=run_scan)
     scan_btn.pack(side="left", padx=(0, 8))
+    usb_scan_btn = tk.Button(btn_row, text="Scan USB", command=run_usb_scan)
+    usb_scan_btn.pack(side="left", padx=(0, 8))
     tk.Button(btn_row, text="Use Selected", command=use_selected_discovery).pack(side="left")
 
     refresh_listbox()
 
 
+# ---------- desktop: Settings tab ----------
+
+def build_settings_tab(parent):
+    tk.Label(parent, text="Recording Mode", font=("Arial", 11, "bold")).pack(anchor="w", padx=16, pady=(16, 6))
+
+    current = load_settings().get("recording_mode", "motion")
+    mode_var = tk.StringVar(value=current)
+
+    tk.Radiobutton(
+        parent, text="Motion-triggered (default) — records only while motion is detected, cheapest on a Pi 3",
+        variable=mode_var, value="motion", justify="left",
+    ).pack(anchor="w", padx=16, pady=2)
+    tk.Radiobutton(
+        parent, text=f"Continuous — always recording at {RECORD_FPS_CONTINUOUS}fps, more disk use and CPU",
+        variable=mode_var, value="continuous", justify="left",
+    ).pack(anchor="w", padx=16, pady=2)
+
+    status_label = tk.Label(parent, text="", fg="green")
+    status_label.pack(anchor="w", padx=16, pady=(10, 0))
+
+    def apply_settings():
+        settings_ = load_settings()
+        settings_["recording_mode"] = mode_var.get()
+        save_settings(settings_)
+        status_label.config(text="Saved — cameras pick this up within a couple seconds, no restart needed.")
+
+    tk.Button(parent, text="Save", command=apply_settings).pack(anchor="w", padx=16, pady=10)
+
+
+# ---------- desktop: in-app recording playback ----------
+
+def open_recording_player(root, filepath):
+    """
+    Plays a recorded .mp4 in its own Toplevel using cv2.VideoCapture +
+    a Tkinter Label — no external player, no OS file-association
+    dependency, since the final device runs on a plain connected
+    monitor with just this app.
+    """
+    cap = cv2.VideoCapture(filepath)
+    if not cap.isOpened():
+        messagebox.showerror("Playback error", f"Couldn't open:\n{filepath}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or RECORD_FPS
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_delay_ms = max(1, int(1000 / fps))
+
+    win = tk.Toplevel(root)
+    win.title(os.path.basename(filepath))
+
+    video_label = tk.Label(win, bg="black")
+    video_label.pack(fill="both", expand=True)
+    photo_holder = {"image": None}
+
+    controls = tk.Frame(win)
+    controls.pack(fill="x", padx=8, pady=6)
+
+    state = {"playing": True, "seeking": False, "after_id": None}
+
+    play_btn = tk.Button(controls, text="Pause")
+    play_btn.pack(side="left", padx=(0, 8))
+
+    time_label = tk.Label(controls, text="0:00 / 0:00", width=12)
+    time_label.pack(side="right")
+
+    def frame_to_time(frame_idx):
+        secs = frame_idx / fps if fps else 0
+        return f"{int(secs // 60)}:{int(secs % 60):02d}"
+
+    seek_var = tk.DoubleVar(value=0)
+    seek_scale = tk.Scale(
+        controls, from_=0, to=max(frame_count - 1, 0), orient="horizontal",
+        variable=seek_var, showvalue=False,
+    )
+    seek_scale.pack(side="left", fill="x", expand=True, padx=8)
+
+    def on_seek_press(event):
+        state["seeking"] = True
+
+    def on_seek_release(event):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, seek_var.get())
+        state["seeking"] = False
+
+    seek_scale.bind("<Button-1>", on_seek_press)
+    seek_scale.bind("<ButtonRelease-1>", on_seek_release)
+
+    def toggle_play():
+        state["playing"] = not state["playing"]
+        play_btn.config(text="Pause" if state["playing"] else "Play")
+
+    play_btn.config(command=toggle_play)
+
+    def show_frame():
+        if state["seeking"]:
+            win.after(frame_delay_ms, show_frame)
+            return
+
+        if state["playing"]:
+            ok, frame = cap.read()
+            if not ok:
+                # end of clip — pause on last frame rather than closing
+                state["playing"] = False
+                play_btn.config(text="Play")
+                win.after(frame_delay_ms, show_frame)
+                return
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+            photo_holder["image"] = photo
+            video_label.configure(image=photo)
+
+            current_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            seek_var.set(current_idx)
+            time_label.config(text=f"{frame_to_time(current_idx)} / {frame_to_time(frame_count)}")
+
+        state["after_id"] = win.after(frame_delay_ms, show_frame)
+
+    def on_close():
+        if state["after_id"] is not None:
+            win.after_cancel(state["after_id"])
+        cap.release()
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+    show_frame()
+
+
+# ---------- desktop: Recordings tab ----------
+
+
+def build_recordings_tab(parent):
+    list_frame = tk.Frame(parent)
+    list_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+    left = tk.Frame(list_frame)
+    left.pack(side="left", fill="y", padx=(0, 16))
+    tk.Label(left, text="Cameras").pack(anchor="w")
+    camera_listbox = tk.Listbox(left, height=15, width=20, exportselection=False)
+    camera_listbox.pack(fill="y")
+
+    right = tk.Frame(list_frame)
+    right.pack(side="left", fill="both", expand=True)
+    tk.Label(right, text="Recordings").pack(anchor="w")
+    file_listbox = tk.Listbox(right, height=15, exportselection=False)
+    file_listbox.pack(fill="both", expand=True)
+
+    status_label = tk.Label(parent, text="", fg="red")
+    status_label.pack(padx=16, anchor="w")
+
+    state = {"files": []}  # index -> full path, kept in sync with file_listbox rows
+
+    def refresh_cameras():
+        camera_listbox.delete(0, "end")
+        if not os.path.isdir(RECORDINGS_DIR):
+            return
+        for cam_name in sorted(os.listdir(RECORDINGS_DIR)):
+            if os.path.isdir(os.path.join(RECORDINGS_DIR, cam_name)):
+                camera_listbox.insert("end", cam_name)
+
+    def refresh_files(event=None):
+        file_listbox.delete(0, "end")
+        state["files"] = []
+        sel = camera_listbox.curselection()
+        if not sel:
+            return
+        cam_name = camera_listbox.get(sel[0])
+        cam_dir = os.path.join(RECORDINGS_DIR, cam_name)
+        if not os.path.isdir(cam_dir):
+            return
+        for filename in sorted(os.listdir(cam_dir), reverse=True):
+            if not filename.endswith(".mp4"):
+                continue
+            full_path = os.path.join(cam_dir, filename)
+            size_mb = os.path.getsize(full_path) / (1024 * 1024)
+            file_listbox.insert("end", f"{filename}  ({size_mb:.1f} MB)")
+            state["files"].append(full_path)
+
+    camera_listbox.bind("<<ListboxSelect>>", refresh_files)
+
+    def play_selected():
+        sel = file_listbox.curselection()
+        if not sel:
+            status_label.config(text="Select a recording first.")
+            return
+        full_path = state["files"][sel[0]]
+        open_recording_player(parent.winfo_toplevel(), full_path)
+
+    def delete_selected():
+        sel = file_listbox.curselection()
+        if not sel:
+            status_label.config(text="Select a recording first.")
+            return
+        full_path = state["files"][sel[0]]
+        try:
+            os.remove(full_path)
+            status_label.config(text="")
+            refresh_files()
+        except OSError as e:
+            status_label.config(text=f"Couldn't delete: {e}")
+
+    btn_row = tk.Frame(parent)
+    btn_row.pack(padx=16, pady=(0, 10), anchor="w")
+    tk.Button(btn_row, text="Play", command=play_selected).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text="Delete", command=delete_selected).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text="Refresh", command=refresh_cameras).pack(side="left")
+
+    refresh_cameras()
+
+
 # ---------- main process ----------
 
 def main():
-    global known_encodings, known_ids, profiles, manager
+    global profiles
 
     multiprocessing.set_start_method("fork")
 
-    manager = multiprocessing.Manager()
-    initial_encodings, initial_ids = load_known_faces_from_disk()
-    initial_profiles = load_profiles_from_disk()
-
-    known_encodings = manager.list(initial_encodings)
-    known_ids = manager.list(initial_ids)
-    profiles = manager.dict(initial_profiles)
-    lock = manager.Lock()
+    profiles = load_profiles_from_disk()
+    if not os.path.exists(SETTINGS_FILE):
+        save_settings(dict(DEFAULT_SETTINGS))
 
     for cam in INITIAL_CAMERAS:
-        start_camera(cam["name"], cam["type"], cam["source"],
-                     known_encodings, known_ids, profiles, registry, manager)
+        start_camera(cam["name"], cam["type"], cam["source"], registry)
 
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
@@ -897,11 +856,17 @@ def main():
 
     camera_tab = tk.Frame(notebook, bg="black")
     manage_tab = tk.Frame(notebook)
+    settings_tab = tk.Frame(notebook)
+    recordings_tab = tk.Frame(notebook)
     notebook.add(camera_tab, text="Camera View")
     notebook.add(manage_tab, text="Manage Cameras")
+    notebook.add(recordings_tab, text="Recordings")
+    notebook.add(settings_tab, text="Settings")
     notebook.add(WiFiTab(notebook), text="WiFi Setup")
 
-    build_manage_tab(manage_tab, registry, known_encodings, known_ids, profiles, manager)
+    build_manage_tab(manage_tab, registry, profiles)
+    build_recordings_tab(recordings_tab)
+    build_settings_tab(settings_tab)
 
     # Video grid (or fullscreen single camera) renders into this Label as a
     # PIL/ImageTk photo — instead of a separate cv2.imshow window — this is
@@ -939,10 +904,6 @@ def main():
         nonlocal fullscreen_camera
 
         if fullscreen_camera is not None:
-            # Any click while fullscreen returns to the grid — kept simple
-            # deliberately: no box-click interaction while fullscreen, since
-            # box coordinates are computed for the small grid thumbnails and
-            # don't line up with the full-resolution fullscreen frame.
             fullscreen_camera = None
             return
 
@@ -961,21 +922,6 @@ def main():
         if idx >= len(names):
             return
         cam_name = names[idx]
-        local_x, local_y = img_x - col * THUMB_W, img_y - row * THUMB_H
-
-        with registry_lock:
-            data = registry.get(cam_name, {}).get("latest")
-
-        if data:
-            for box in data.get("boxes", []):
-                if box["x1"] <= local_x <= box["x2"] and box["y1"] <= local_y <= box["y2"]:
-                    if box["id"] is None:
-                        pass#open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock)
-                    else:
-                        open_known_popup(root, box, profiles, lock)
-                    return
-
-        # No face box hit — go fullscreen on this camera instead
         fullscreen_camera = cam_name
 
     video_label.bind("<Button-1>", on_click)
@@ -995,20 +941,22 @@ def main():
                 with registry_lock:
                     registry[cam_name]["latest"] = latest
                     registry[cam_name]["latest_time"] = time.time()
+                    registry[cam_name]["motion"] = latest.get("motion", False)
             except queue_module.Empty:
                 pass
 
-            with viewer_counts_lock:
-                has_web_viewer = viewer_counts.get(cam_name, 0) > 0
-            wants_full_res = has_web_viewer or (fullscreen_camera == cam_name)
-
-            if wants_full_res:
-                try:
-                    full_frame = registry[cam_name]["live_queue"].get_nowait()
-                    with registry_lock:
-                        registry[cam_name]["latest_full_frame"] = full_frame
-                except queue_module.Empty:
-                    pass
+            # Full-res frame is only pulled when something actually needs
+            # it — the desktop fullscreen view, or the web MJPEG stream
+            # (which reads latest_full_frame directly from another thread,
+            # so we keep it updated any time a camera exists, not just on
+            # fullscreen — the web stream has no equivalent gate on a Pi 3
+            # build since there's no per-viewer negotiation like WebRTC had).
+            try:
+                full_frame = registry[cam_name]["live_queue"].get_nowait()
+                with registry_lock:
+                    registry[cam_name]["latest_full_frame"] = full_frame
+            except queue_module.Empty:
+                pass
 
         if fullscreen_camera is not None and fullscreen_camera in names:
             with registry_lock:
@@ -1043,7 +991,7 @@ def main():
         photo_holder["image"] = photo
         video_label.configure(image=photo)
 
-        root.after(30, update_frame)
+        root.after(GUI_REFRESH_MS, update_frame)
 
     update_frame()
 
