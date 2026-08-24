@@ -24,6 +24,7 @@ Usage:
 import concurrent.futures
 import glob
 import ipaddress
+import os
 import re
 import socket
 import subprocess
@@ -138,16 +139,60 @@ def _is_capture_device(device_path):
     the actual capture stream (common with UVC cameras that expose 2
     nodes per physical camera). Try opening it with OpenCV as the real
     filter — this matches what start_camera will actually do.
+
+    Forces the V4L2 backend explicitly and requests MJPG — a lot of
+    cheap composite UVC webcams (this includes the common Jieli
+    Technology chipset) fail to negotiate a working format under
+    OpenCV's default backend/format autodetection, even though the
+    device itself is fine. Retries a few reads with a short pause on
+    top of that, since these cameras often fail their very first read
+    right after open while still initializing.
+
+    Prints why a device was rejected instead of silently swallowing
+    the reason — a permission error and "not a real capture stream"
+    look identical from the caller otherwise, and you can't tell which
+    one you're dealing with without this.
     """
+    import time as _time
+    import cv2
+
+    if not os.access(device_path, os.R_OK | os.W_OK):
+        print(f"[discover] {device_path}: no read/write permission — "
+              f"is this user in the 'video' group? (sudo usermod -aG video $USER, then re-login)")
+        return False
+
     try:
-        import cv2
-        cap = cv2.VideoCapture(device_path)
-        ok = cap.isOpened()
-        if ok:
-            ok, _ = cap.read()
+        import numpy as _np
+        cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            print(f"[discover] {device_path}: OpenCV couldn't open it via V4L2")
+            return False
+
+        # Resolution before format — and fall back to YUYV if the hardware
+        # rejects MJPEG outright, matching the same fix applied in
+        # multi_camera.py's usb_frame_generator after MJPEG-only detection
+        # turned out to be too strict for some UVC firmwares.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")):
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+
+        ok = False
+        attempt = 0
+        for attempt in range(15):
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0 and _np.count_nonzero(frame) > 0:
+                ok = True
+                break
+            _time.sleep(0.2)
         cap.release()
+        if not ok:
+            print(f"[discover] {device_path}: opened but never returned a valid frame "
+                  f"(tried {attempt + 1}x) — likely a metadata-only node, not the capture stream")
         return ok
-    except Exception:
+    except Exception as e:
+        print(f"[discover] {device_path}: {e}")
         return False
 
 
@@ -159,7 +204,7 @@ def discover_usb_cameras():
     the device path).
     """
     found = []
-    for device_path in sorted(glob.glob("/dev/video*")):
+    for device_path in sorted(glob.glob("/dev/video*"), key=lambda p: int(re.search(r"(\d+)$", p).group(1))):
         match = re.search(r"video(\d+)$", device_path)
         if not match:
             continue
