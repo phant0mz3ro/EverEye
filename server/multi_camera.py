@@ -1,23 +1,21 @@
 """
 Multi-camera security system — PI 3 BASELINE.
 
-Deliberately stripped down to the minimum: capture frames from each
-camera and display them in a grid on screen. Nothing else. No
-recording, no motion detection, no web/remote view, no discovery
-scanning, no settings, no recordings browser, no WiFi tab.
+Capture frames from each camera and display them in a grid, plus a
+Manage Cameras tab to add/remove cameras from the GUI. Still no
+recording, motion detection, web/remote view, discovery scanning,
+settings, recordings browser, or WiFi tab.
 
 This exists as a known-good floor after a round of optimization
 attempts (hardware-encode recording, live-view gating) that turned
 out to cost more than they saved and made the app laggy under load.
-Rather than keep patching a stack that's hard to reason about, the
-plan is: confirm THIS is smooth and cheap on the actual Pi 3 first,
-then add features back one at a time, checking CPU after each one —
-so if something makes it worse again, it's obvious which change did
-it, instead of guessing across a pile of simultaneous changes.
+Confirmed baseline (capture+display only) sits under 25% CPU across
+cores on the actual Pi 3 — the plan is to add features back one at a
+time from here, checking CPU after each one, so if something makes it
+worse again it's obvious which change did it.
 
-Planned re-add order (roughly cheapest/safest first):
-    1. Manage Cameras tab (add/remove cameras from the GUI, not just
-       the hardcoded list below)
+Re-add order:
+    1. Manage Cameras tab (add/remove cameras from the GUI) — DONE
     2. Recording — AsyncSegmentWriter + CV2SegmentWriter (mp4v,
        downscaled, off the capture thread) from the previous round,
        since that part was validated as correctly decoupled — just
@@ -28,9 +26,8 @@ Planned re-add order (roughly cheapest/safest first):
     6. Settings tab, Recordings tab, in-app player
     7. WiFi Setup tab
 
-Edit INITIAL_CAMERAS below to point at your cameras — this baseline
-has no add/remove UI yet, on purpose, to keep the surface area small
-while establishing the floor.
+INITIAL_CAMERAS below still seeds cameras at startup, but the Manage
+Cameras tab is now the actual way to add/remove them at runtime.
 """
 
 import math
@@ -39,6 +36,7 @@ import queue as queue_module
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk
 
 import cv2
 
@@ -54,7 +52,7 @@ from PIL import Image, ImageTk
 
 INITIAL_CAMERAS = [
     # {"name": "front_door", "type": "http", "source": "http://192.168.1.42:81/stream"},
-    {"name": "usb_cam", "type": "usb", "source": 0},
+    # {"name": "usb_cam", "type": "usb", "source": 0},
 ]
 
 THUMB_W = 320
@@ -208,6 +206,92 @@ def stop_camera(name, registry_):
     entry["capture_p"].join()
 
 
+# ---------- desktop: Manage Cameras tab ----------
+
+def build_manage_tab(parent, registry_):
+    listbox = tk.Listbox(parent, height=8, exportselection=False)
+    listbox.pack(padx=16, pady=(16, 6), fill="x")
+
+    def refresh_listbox():
+        listbox.delete(0, "end")
+        with registry_lock:
+            names = list(registry_.keys())
+        for name in names:
+            listbox.insert("end", name)
+
+    refresh_listbox()
+
+    remove_btn = tk.Button(parent, text="Remove Selected")
+    remove_btn.pack(padx=16, pady=(0, 16), anchor="w")
+
+    tk.Label(parent, text="Add Camera", font=("Arial", 11, "bold")).pack(anchor="w", padx=16, pady=(4, 6))
+
+    form = tk.Frame(parent)
+    form.pack(padx=16, pady=(0, 6), fill="x")
+
+    tk.Label(form, text="Name:").grid(row=0, column=0, sticky="w", pady=2)
+    name_entry = tk.Entry(form, width=30)
+    name_entry.grid(row=0, column=1, sticky="w", pady=2)
+
+    tk.Label(form, text="Type:").grid(row=1, column=0, sticky="w", pady=2)
+    type_var = tk.StringVar(value="http")
+    type_menu = tk.OptionMenu(form, type_var, "http", "usb")
+    type_menu.grid(row=1, column=1, sticky="w", pady=2)
+
+    tk.Label(form, text="Source:").grid(row=2, column=0, sticky="w", pady=2)
+    source_entry = tk.Entry(form, width=40)
+    source_entry.grid(row=2, column=1, sticky="w", pady=2)
+    tk.Label(
+        form, text="(http: full stream URL — e.g. http://192.168.1.42:81/stream)\n"
+                    "(usb: device index — e.g. 0)",
+        fg="gray", justify="left",
+    ).grid(row=3, column=1, sticky="w")
+
+    status_label = tk.Label(parent, text="", fg="red")
+    status_label.pack(padx=16, anchor="w")
+
+    def add_camera():
+        name = name_entry.get().strip()
+        cam_type = type_var.get()
+        source = source_entry.get().strip()
+
+        with registry_lock:
+            exists = name in registry_
+
+        if not name or not source:
+            status_label.config(text="Name and source are both required.")
+            return
+        if exists:
+            status_label.config(text=f"A camera named '{name}' already exists.")
+            return
+        if cam_type == "usb":
+            try:
+                source = int(source)
+            except ValueError:
+                status_label.config(text="USB source must be a device index number (e.g. 0).")
+                return
+
+        status_label.config(text="")
+        start_camera(name, cam_type, source, registry_)
+        refresh_listbox()
+        name_entry.delete(0, "end")
+        source_entry.delete(0, "end")
+
+    tk.Button(parent, text="Add", command=add_camera).pack(padx=16, pady=(0, 16), anchor="w")
+
+    def remove_camera():
+        sel = listbox.curselection()
+        if not sel:
+            status_label.config(text="Select a camera to remove first.")
+            return
+        name = listbox.get(sel[0])
+        stop_camera(name, registry_)
+        status_label.config(text="")
+        refresh_listbox()
+
+    remove_btn.config(command=remove_camera)
+
+
 # ---------- main process ----------
 
 def main():
@@ -226,7 +310,16 @@ def main():
     root = tk.Tk()
     root.title("Security Cameras — Pi 3 baseline")
 
-    video_label = tk.Label(root, bg="black")
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    camera_tab = tk.Frame(notebook, bg="black")
+    manage_tab = tk.Frame(notebook)
+    notebook.add(camera_tab, text="Camera View")
+    notebook.add(manage_tab, text="Manage Cameras")
+    build_manage_tab(manage_tab, registry)
+
+    video_label = tk.Label(camera_tab, bg="black")
     video_label.pack(fill="both", expand=True)
     photo_holder = {"image": None}
     canvas_cache = {"canvas": None, "shape": None}
