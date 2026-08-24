@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk
 
 import cv2
-#import face_recognition
+import face_recognition
 import mediapipe as mp
 import numpy as np
 import requests
@@ -215,7 +215,6 @@ def open_new_segment(camera_name, frame_w, frame_h):
 
 
 # ---------- detector process ----------
-"""
 def detector_worker(camera_name, known_encodings_, known_ids_, profiles_, frame_queue, boxes_queue, stop_event):
     os.makedirs(FACE_SAVE_DIR, exist_ok=True)
     save_executor = ThreadPoolExecutor(max_workers=1)
@@ -324,7 +323,6 @@ def detector_worker(camera_name, known_encodings_, known_ids_, profiles_, frame_
                 push_latest(boxes_queue, new_boxes)
 
     save_executor.shutdown(wait=False)
-"""
 
 # ---------- capture process ----------
 
@@ -462,7 +460,6 @@ def open_known_popup(root, box, profiles_, lock):
 
     tk.Button(win, text="Save", command=save_profile).pack(pady=10)
 
-"""
 def open_unknown_popup(root, box, known_encodings_, known_ids_, profiles_, lock):
     win = tk.Toplevel(root)
     win.title("Unknown — Enroll")
@@ -517,7 +514,7 @@ def open_unknown_popup(root, box, known_encodings_, known_ids_, profiles_, lock)
 
     tk.Button(win, text="Enroll as known", command=enroll).pack(pady=(0, 10))
 
-"""
+
 # ---------- camera lifecycle (add/remove live, from desktop OR web) ----------
 
 def start_camera(name, cam_type, source, known_encodings_, known_ids_, profiles_, registry_, manager_):
@@ -535,7 +532,7 @@ def start_camera(name, cam_type, source, known_encodings_, known_ids_, profiles_
         target=capture_worker,
         args=(name, cam_type, source, frame_queue, boxes_queue, out_queue, live_queue),
     )
-    #detector_p.start()
+    detector_p.start()
     capture_p.start()
 
     with registry_lock:
@@ -543,7 +540,7 @@ def start_camera(name, cam_type, source, known_encodings_, known_ids_, profiles_
             "out_queue": out_queue,
             "live_queue": live_queue,
             "stop_event": stop_event,
-            #"detector_p": detector_p,
+            "detector_p": detector_p,
             "capture_p": capture_p,
             "latest": None,
             "latest_time": None,
@@ -557,9 +554,9 @@ def stop_camera(name, registry_):
     if entry is None:
         return
     entry["stop_event"].set()
-    #entry["detector_p"].terminate()
+    entry["detector_p"].terminate()
     entry["capture_p"].terminate()
-    #entry["detector_p"].join()
+    entry["detector_p"].join()
     entry["capture_p"].join()
 
 
@@ -970,7 +967,7 @@ def main():
             for box in data.get("boxes", []):
                 if box["x1"] <= local_x <= box["x2"] and box["y1"] <= local_y <= box["y2"]:
                     if box["id"] is None:
-                        pass#open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock)
+                        open_unknown_popup(root, box, known_encodings, known_ids, profiles, lock)
                     else:
                         open_known_popup(root, box, profiles, lock)
                     return
