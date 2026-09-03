@@ -24,11 +24,16 @@ Re-add order:
         cv2.VideoCapture + Tkinter) — DONE, pulled forward out of the
         original order (was step 6) since there's no point recording
         without a way to see the clips yet.
-    3. Motion detection (cheap OpenCV frame-diff, no mediapipe/dlib)
+    3. Motion detection (cheap OpenCV frame-diff, no mediapipe/dlib) — DONE.
+       Downscaled grayscale diff, checked every few frames, gates what
+       capture_worker submits to the recorder when recording_mode is set
+       to motion. A hold window keeps one motion event in a single clip
+       instead of chopping it up. Settings tab mode selector (originally
+       step 6) pulled forward alongside this since the mode has to be
+       switchable somewhere for motion detection to be testable at all.
     4. Web/remote MJPEG view
     5. USB + network discovery scanning
-    6. Settings tab (recording mode: motion vs continuous)
-    7. WiFi Setup tab
+    6. WiFi Setup tab
 
 INITIAL_CAMERAS below still seeds cameras at startup, but the Manage
 Cameras tab is now the actual way to add/remove them at runtime.
@@ -61,7 +66,7 @@ from PIL import Image, ImageTk
 
 INITIAL_CAMERAS = [
     # {"name": "front_door", "type": "http", "source": "http://192.168.1.42:81/stream"},
-    # {"name": "usb_cam", "type": "usb", "source": 0},
+     {"name": "usb_cam", "type": "usb", "source": 0},
 ]
 
 THUMB_W = 320
@@ -69,9 +74,23 @@ THUMB_H = 240
 GUI_REFRESH_MS = 120  # a security grid doesn't need 30fps — this is plenty and cheap
 
 RECORDINGS_DIR = "recordings"
-RECORDING_SEGMENT_SEC = 10 * 60  # new file every 30 minutes
+RECORDING_SEGMENT_SEC = .10 * 60  # new file every 30 minutes
 RECORD_WIDTH = 640  # pixel count drives encode cost more than fps does — cap it
 RECORD_FPS = 10  # approximate — actual pull rate varies, this just sets playback speed metadata
+
+RECORDING_MODE_CONTINUOUS = 0
+RECORDING_MODE_MOTION = 1
+
+# Motion detection stays deliberately dumb — grayscale frame-diff on a small
+# downscaled copy, checked every few frames rather than every frame. A
+# background-subtraction model (MOG2 etc.) would cost meaningfully more per
+# frame for accuracy this app doesn't need.
+MOTION_CHECK_EVERY_N_FRAMES = 3      # skip most frames — motion doesn't need per-frame granularity
+MOTION_DOWNSCALE_WIDTH = 160         # diff on a tiny frame; cost scales with pixel count
+MOTION_DIFF_THRESHOLD = 25           # per-pixel grayscale delta to count as "changed"
+MOTION_MIN_CHANGED_RATIO = 0.1      # fraction of downscaled pixels that must change to call it motion
+MOTION_RECORD_HOLD_SEC = 8           # keep recording this long after the last motion hit, so a clip
+                                      # doesn't chop itself into fragments during one continuous event
 
 # The GUI only redraws every GUI_REFRESH_MS and recording only wants ~RECORD_FPS,
 # so a network camera pushing MJPEG faster than this is pure wasted decode CPU —
@@ -240,11 +259,13 @@ class FfmpegSegmentWriter:
             self.temp_path,
         ]
         try:
-            # stdout/stderr to DEVNULL rather than left to inherit or PIPE
-            # unread — an unread PIPE can fill up and make ffmpeg block
-            # trying to write to it, which would hang our writes too.
+            # stderr captured (not DEVNULL) for now so a write failure can
+            # report ffmpeg's actual error instead of just "broken pipe" —
+            # same diagnosis trick that found the "-f mp4" muxer issue
+            # earlier. stdout stays DEVNULL; with -loglevel error ffmpeg
+            # writes nothing there, so it can't fill up and block.
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         except OSError as e:
             print(f"[{self.camera_name}] Couldn't start ffmpeg: {e} — recording disabled for this camera", flush=True)
             self.proc = None
@@ -300,7 +321,23 @@ class FfmpegSegmentWriter:
         try:
             self.proc.stdin.write(frame.tobytes())
         except (BrokenPipeError, OSError) as e:
-            print(f"[{self.camera_name}] ffmpeg pipe write failed: {e} — will reopen on the next frame", flush=True)
+            # The write failing means ffmpeg already exited on its own —
+            # grab whatever it printed to stderr so the actual cause shows
+            # up here instead of just "broken pipe".
+            stderr_tail = ""
+            try:
+                self.proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                self.proc.wait(timeout=2)
+                if self.proc.stderr is not None:
+                    stderr_tail = self.proc.stderr.read().decode(errors="replace").strip()
+            except subprocess.TimeoutExpired:
+                pass
+            print(f"[{self.camera_name}] ffmpeg pipe write failed: {e} — "
+                  f"ffmpeg exit code {self.proc.returncode}, stderr: {stderr_tail!r} — "
+                  f"will reopen on the next frame", flush=True)
             self.proc = None
 
     def close(self):
@@ -351,10 +388,50 @@ class AsyncSegmentWriter:
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=5)
+class MotionDetector:
+    """
+    Cheap per-camera motion check: downscale to MOTION_DOWNSCALE_WIDTH,
+    grayscale, absdiff against the previous checked frame, threshold, and
+    see how much of the frame changed. Only actually runs the diff every
+    MOTION_CHECK_EVERY_N_FRAMES-th call — the rest are free no-ops — so
+    the per-frame cost in the capture loop is close to zero most of the
+    time. Lives entirely inside one camera's capture process; no shared
+    state with anything else.
+    """
+
+    def __init__(self):
+        self._prev_gray = None
+        self._frame_count = 0
+
+    def check(self, frame):
+        """Returns True only on a frame where motion was actually detected.
+        Most calls return False either because it wasn't this camera's turn
+        to be checked yet, or because nothing changed enough — callers that
+        need a "recording gate" should combine this with their own hold/
+        cooldown window rather than treating a lone False as "no motion"."""
+        self._frame_count += 1
+        if self._frame_count % MOTION_CHECK_EVERY_N_FRAMES != 0:
+            return False
+
+        h, w = frame.shape[:2]
+        scale = MOTION_DOWNSCALE_WIDTH / w
+        small = cv2.resize(frame, (MOTION_DOWNSCALE_WIDTH, max(2, int(h * scale))))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        if self._prev_gray is None or self._prev_gray.shape != gray.shape:
+            self._prev_gray = gray
+            return False
+
+        diff = cv2.absdiff(gray, self._prev_gray)
+        self._prev_gray = gray
+        changed = cv2.countNonZero(cv2.threshold(diff, MOTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)[1])
+        return (changed / diff.size) >= MOTION_MIN_CHANGED_RATIO
+
+
 # ---------- capture process ----------
 # One process per camera: pull frames, build a thumbnail, record, nothing else.
 
-def capture_worker(camera_name, camera_type, source, out_queue, record_enabled):
+def capture_worker(camera_name, camera_type, source, out_queue, record_enabled, recording_mode):
     if camera_type == "usb":
         source_desc = f"USB device {source}"
         frames = usb_frame_generator(source)
@@ -364,6 +441,8 @@ def capture_worker(camera_name, camera_type, source, out_queue, record_enabled):
 
     print(f"[{camera_name}] Connecting to {source_desc} ...", flush=True)
     recorder = AsyncSegmentWriter(camera_name)
+    motion_detector = MotionDetector()
+    motion_hold_until = 0.0  # monotonic-ish wall clock deadline; recording stays open until this passes
     try:
         for frame in frames:
             thumb = cv2.resize(frame, (THUMB_W, THUMB_H))
@@ -371,8 +450,19 @@ def capture_worker(camera_name, camera_type, source, out_queue, record_enabled):
             # Checked here, not inside AsyncSegmentWriter, so a disabled
             # toggle skips the submit entirely — no point queuing/copying a
             # full-res frame that's about to be thrown away.
-            if record_enabled.value:
-                recorder.submit(frame)  # full-res frame — AsyncSegmentWriter.submit() downscales it
+            if not record_enabled.value:
+                continue
+            if recording_mode.value == RECORDING_MODE_MOTION:
+                if motion_detector.check(frame):
+                    if time.time() >= motion_hold_until:
+                        # only prints on the idle→active edge, not every
+                        # hit — cheap way to see how often it's actually
+                        # triggering without flooding the log
+                        print(f"[{camera_name}] motion detected — recording for {MOTION_RECORD_HOLD_SEC}s", flush=True)
+                    motion_hold_until = time.time() + MOTION_RECORD_HOLD_SEC
+                if time.time() >= motion_hold_until:
+                    continue  # no recent motion — don't submit this frame
+            recorder.submit(frame)  # full-res frame — AsyncSegmentWriter.submit() downscales it
     except Exception as e:
         print(f"[{camera_name}] Stopped: {e}", flush=True)
     finally:
@@ -381,11 +471,11 @@ def capture_worker(camera_name, camera_type, source, out_queue, record_enabled):
 
 # ---------- camera lifecycle ----------
 
-def start_camera(name, cam_type, source, registry_, record_enabled):
+def start_camera(name, cam_type, source, registry_, record_enabled, recording_mode):
     out_queue = multiprocessing.Queue(maxsize=1)
     capture_p = multiprocessing.Process(
         target=capture_worker,
-        args=(name, cam_type, source, out_queue, record_enabled),
+        args=(name, cam_type, source, out_queue, record_enabled, recording_mode),
     )
     capture_p.start()
 
@@ -472,7 +562,7 @@ class ScrollableFrame(tk.Frame):
 
 # ---------- desktop: Manage Cameras tab ----------
 
-def build_manage_tab(parent, registry_, record_enabled):
+def build_manage_tab(parent, registry_, record_enabled, recording_mode):
     listbox = tk.Listbox(parent, height=8, exportselection=False)
     listbox.pack(padx=16, pady=(16, 6), fill="x")
 
@@ -613,7 +703,7 @@ def build_manage_tab(parent, registry_, record_enabled):
                 return
 
         status_label.config(text="")
-        start_camera(name, cam_type, source, registry_, record_enabled)
+        start_camera(name, cam_type, source, registry_, record_enabled, recording_mode)
         refresh_listbox()
         name_entry.delete(0, "end")
         source_entry.delete(0, "end")
@@ -635,11 +725,11 @@ def build_manage_tab(parent, registry_, record_enabled):
 
 # ---------- desktop: Settings tab ----------
 
-def build_settings_tab(parent, record_enabled):
+def build_settings_tab(parent, record_enabled, recording_mode):
     """
-    Global settings. Currently just the record on/off master switch — the
-    motion-vs-continuous mode choice slots in here once motion detection
-    (re-add step 3) lands; recording is unconditional/continuous until then.
+    Global settings: the record on/off master switch, plus the recording
+    mode (continuous vs motion-triggered) that gates what capture_worker
+    actually submits to the recorder for each camera.
     """
     body = tk.Frame(parent)
     body.pack(fill="both", expand=True, padx=16, pady=16)
@@ -665,66 +755,199 @@ def build_settings_tab(parent, record_enabled):
         fg="gray", justify="left",
     ).pack(anchor="w", pady=(6, 0))
 
+    tk.Label(body, text="Recording mode", font=("Arial", 11, "bold")).pack(anchor="w", pady=(16, 6))
+
+    mode_var = tk.IntVar(value=recording_mode.value)
+
+    def on_mode_change():
+        with recording_mode.get_lock():
+            recording_mode.value = mode_var.get()
+
+    tk.Radiobutton(
+        body, text="Continuous — record everything, all the time",
+        variable=mode_var, value=RECORDING_MODE_CONTINUOUS, command=on_mode_change,
+    ).pack(anchor="w")
+    tk.Radiobutton(
+        body, text="Motion-triggered — only record when something moves",
+        variable=mode_var, value=RECORDING_MODE_MOTION, command=on_mode_change,
+    ).pack(anchor="w")
+
+    tk.Label(
+        body,
+        text="Motion-triggered keeps recording for a few seconds after the\n"
+             "last motion, so one event stays in a single clip. Applies to\n"
+             "every camera; this setting only matters when recording above\n"
+             "is on.",
+        fg="gray", justify="left",
+    ).pack(anchor="w", pady=(6, 0))
+
 
 # ---------- desktop: Recordings tab ----------
 
-def open_recording_player(root, filepath):
+def _format_time(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m}:{s:02d}"
+
+
+class RecordingPlayer:
     """
-    Plays a saved clip in its own Toplevel window using cv2.VideoCapture +
-    a Tkinter Label — no shelling out to an OS video player, since the
-    final device is a Pi with no external player to hand off to.
+    Embedded clip player — lives inside the Recordings tab itself (no
+    Toplevel popup) so it plays inline the same way it will on the final
+    Pi + monitor device. Backed by cv2.VideoCapture + a Tkinter Label for
+    frames, with a Scale widget as the seek bar.
     """
-    player = tk.Toplevel(root)
-    player.title(os.path.basename(filepath))
 
-    cap = cv2.VideoCapture(filepath)
-    if not cap.isOpened():
-        tk.Label(player, text="Could not open this clip.", fg="red").pack(padx=20, pady=20)
-        return
+    def __init__(self, parent, get_delay_ms):
+        self.get_delay_ms = get_delay_ms
+        self.cap = None
+        self.playing = False
+        self.seeking = False
+        self.total_frames = 0
+        self.fps = RECORD_FPS
+        self.after_id = None
+        self.photo = None  # keep a reference so Tk doesn't garbage-collect it
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    delay_ms = int(1000 / fps) if fps and fps > 0 else int(1000 / RECORD_FPS)
+        self.frame = tk.Frame(parent)
 
-    video_label = tk.Label(player, bg="black")
-    video_label.pack(fill="both", expand=True)
-    photo_holder = {"image": None}
+        self.video_label = tk.Label(self.frame, bg="black")
+        self.video_label.pack(fill="both", expand=True)
 
-    state = {"playing": True}
+        controls = tk.Frame(self.frame)
+        controls.pack(fill="x", pady=(6, 0))
 
-    controls = tk.Frame(player)
-    controls.pack(fill="x", pady=6)
+        self.play_btn = tk.Button(controls, text="Play", command=self.toggle_play, state="disabled")
+        self.play_btn.pack(side="left", padx=(0, 8))
 
-    def toggle_play():
-        state["playing"] = not state["playing"]
-        play_btn.config(text="Pause" if state["playing"] else "Play")
+        self.time_label = tk.Label(controls, text="0:00 / 0:00", width=12)
+        self.time_label.pack(side="left", padx=(0, 8))
 
-    play_btn = tk.Button(controls, text="Pause", command=toggle_play)
-    play_btn.pack(side="left", padx=8)
+        self.seek_var = tk.DoubleVar(value=0)
+        self.seek_scale = ttk.Scale(
+            controls, from_=0, to=1, orient="horizontal",
+            variable=self.seek_var, command=self._on_seek_drag,
+        )
+        self.seek_scale.pack(side="left", fill="x", expand=True)
+        self.seek_scale.state(["disabled"])
+        self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
 
-    def on_close():
-        cap.release()
-        player.destroy()
+    def pack(self, **kwargs):
+        self.frame.pack(**kwargs)
 
-    tk.Button(controls, text="Close", command=on_close).pack(side="left", padx=8)
-    player.protocol("WM_DELETE_WINDOW", on_close)
+    def _cancel_scheduled(self):
+        if self.after_id is not None:
+            try:
+                self.frame.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+            self.after_id = None
 
-    def update():
-        if not player.winfo_exists():
+    def load(self, filepath, status_cb=None):
+        self.stop()
+        cap = cv2.VideoCapture(filepath)
+        if not cap.isOpened():
+            if status_cb:
+                status_cb(f"Could not open {os.path.basename(filepath)}.")
             return
-        if state["playing"]:
-            ret, frame = cap.read()
-            if not ret:
-                # end of clip — loop back to the start rather than just stopping
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-            if ret:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
-                photo_holder["image"] = photo
-                video_label.configure(image=photo)
-        player.after(delay_ms, update)
+        self.cap = cap
+        self.fps = cap.get(cv2.CAP_PROP_FPS) or RECORD_FPS
+        self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    update()
+        self.seek_scale.state(["!disabled"])
+        self.seek_scale.configure(to=max(self.total_frames - 1, 1))
+        self.seek_var.set(0)
+        self.play_btn.config(text="Pause", state="normal")
+
+        self.playing = True
+        self._schedule()
+
+    def _schedule(self):
+        self._cancel_scheduled()
+        if not self.frame.winfo_exists():
+            return
+        self.after_id = self.frame.after(self.get_delay_ms(self.fps), self._update)
+
+    def _update(self):
+        self.after_id = None
+        if self.cap is None or not self.frame.winfo_exists():
+            return
+        if self.playing and not self.seeking:
+            ret, frame = self.cap.read()
+            if not ret:
+                # end of clip — pause on the last frame, seek bar at the end
+                self.playing = False
+                self.play_btn.config(text="Play")
+                if self.total_frames:
+                    self.seek_var.set(self.total_frames - 1)
+            else:
+                self._show_frame(frame)
+                if not self.seeking:
+                    self.seek_var.set(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            self._update_time_label()
+        if self.playing:
+            self._schedule()
+
+    def _show_frame(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self.photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        self.video_label.configure(image=self.photo)
+
+    def _update_time_label(self):
+        if self.cap is None or not self.fps:
+            return
+        pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES) / self.fps
+        total = (self.total_frames / self.fps) if self.total_frames else 0
+        self.time_label.config(text=f"{_format_time(pos)} / {_format_time(total)}")
+
+    def toggle_play(self):
+        if self.cap is None:
+            return
+        self.playing = not self.playing
+        self.play_btn.config(text="Pause" if self.playing else "Play")
+        if self.playing:
+            self._schedule()
+
+    def _on_seek_press(self, event):
+        self.seeking = True
+
+    def _on_seek_drag(self, value):
+        # live-update the time label while dragging, without pulling frames
+        if self.cap is not None and self.fps:
+            pos = float(value) / self.fps
+            total = (self.total_frames / self.fps) if self.total_frames else 0
+            self.time_label.config(text=f"{_format_time(pos)} / {_format_time(total)}")
+
+    def _on_seek_release(self, event):
+        if self.cap is not None:
+            frame_no = int(self.seek_var.get())
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            ret, frame = self.cap.read()
+            if ret:
+                self._show_frame(frame)
+                # cap.read() advances one frame past frame_no — step back
+                # so playback resumes from where the user actually dropped it
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            self._update_time_label()
+        self.seeking = False
+        if self.playing:
+            self._schedule()
+
+    def stop(self):
+        self._cancel_scheduled()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.playing = False
+        self.seeking = False
+        self.total_frames = 0
+        self.photo = None
+        self.video_label.configure(image="")
+        self.play_btn.config(text="Play", state="disabled")
+        self.seek_var.set(0)
+        self.seek_scale.configure(to=1)
+        self.seek_scale.state(["disabled"])
+        self.time_label.config(text="0:00 / 0:00")
 
 
 def build_recordings_tab(parent, root):
@@ -732,15 +955,23 @@ def build_recordings_tab(parent, root):
 
     body = tk.Frame(parent)
     body.pack(fill="both", expand=True, padx=16, pady=16)
+    body.rowconfigure(0, weight=1)
+    body.columnconfigure(0, weight=1)
+    body.columnconfigure(1, weight=1)
 
-    tk.Label(body, text="Camera:").grid(row=0, column=0, sticky="w")
-    tk.Label(body, text="Clips:").grid(row=0, column=1, sticky="w", padx=(16, 0))
+    # Player sits on top, in the tab itself — no separate window pops up
+    # when a clip is played.
+    player = RecordingPlayer(body, get_delay_ms=lambda fps: int(1000 / fps) if fps else int(1000 / RECORD_FPS))
+    player.frame.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 16))
+
+    tk.Label(body, text="Camera:").grid(row=1, column=0, sticky="w")
+    tk.Label(body, text="Clips:").grid(row=1, column=1, sticky="w", padx=(16, 0))
 
     camera_listbox = tk.Listbox(body, height=12, width=24, exportselection=False)
-    camera_listbox.grid(row=1, column=0, sticky="ns")
+    camera_listbox.grid(row=2, column=0, sticky="ns")
 
     clip_listbox = tk.Listbox(body, height=12, width=36, exportselection=False)
-    clip_listbox.grid(row=1, column=1, sticky="ns", padx=(16, 0))
+    clip_listbox.grid(row=2, column=1, sticky="ns", padx=(16, 0))
 
     status_label = tk.Label(parent, text="", fg="red")
     status_label.pack(padx=16, anchor="w")
@@ -789,7 +1020,10 @@ def build_recordings_tab(parent, root):
             status_label.config(text="Select a clip to play first.")
             return
         status_label.config(text="")
-        open_recording_player(root, clip_path(camera_name, clip_listbox.get(sel[0])))
+        player.load(clip_path(camera_name, clip_listbox.get(sel[0])), status_cb=status_label.config)
+
+    # double-click a clip to play it, same as the Play button
+    clip_listbox.bind("<Double-Button-1>", lambda e: play_selected())
 
     def delete_selected():
         camera_name = selected_camera()
@@ -832,9 +1066,12 @@ def main():
     # which runs in its own process. "b" = signed char; get_lock() guards
     # the read-modify-write from the GUI thread against a torn write.
     record_enabled = multiprocessing.Value("b", 1)
+    # Same sharing rationale as record_enabled — a plain int on the Settings
+    # tab wouldn't be visible to capture_worker's own process.
+    recording_mode = multiprocessing.Value("b", RECORDING_MODE_CONTINUOUS)
 
     for cam in INITIAL_CAMERAS:
-        start_camera(cam["name"], cam["type"], cam["source"], registry, record_enabled)
+        start_camera(cam["name"], cam["type"], cam["source"], registry, record_enabled, recording_mode)
 
     root = tk.Tk()
     root.title("Security Cameras — Pi 3 baseline")
@@ -850,8 +1087,8 @@ def main():
     notebook.add(manage_tab, text="Manage Cameras")
     notebook.add(settings_tab, text="Settings")
     notebook.add(recordings_tab, text="Recordings")
-    build_manage_tab(manage_tab.body, registry, record_enabled)
-    build_settings_tab(settings_tab.body, record_enabled)
+    build_manage_tab(manage_tab.body, registry, record_enabled, recording_mode)
+    build_settings_tab(settings_tab.body, record_enabled, recording_mode)
     build_recordings_tab(recordings_tab.body, root)
 
     wifi_scroll = ScrollableFrame(notebook)
