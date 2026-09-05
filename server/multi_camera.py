@@ -61,6 +61,7 @@ cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # quiets OpenC
 import numpy as np
 import requests
 from PIL import Image, ImageTk
+from flask import Flask, Response, render_template_string
 
 # ---------- config ----------
 
@@ -100,6 +101,79 @@ NETWORK_STREAM_MIN_INTERVAL = 1.0 / NETWORK_STREAM_MAX_FPS
 
 registry = {}  # camera_name -> {out_queue, capture_p, latest, latest_time}
 registry_lock = threading.Lock()
+
+web_app = Flask(__name__)
+
+# Basic embedded web dashboard template
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pi Security - Select View</title>
+    <style>
+        body { background-color: #121212; color: #fff; font-family: sans-serif; margin: 0; padding: 20px; display: flex; gap: 20px; }
+        .sidebar { width: 220px; background: #1e1e1e; padding: 15px; border-radius: 8px; }
+        .sidebar h2 { font-size: 18px; margin-top: 0; }
+        .cam-btn { display: block; width: 100%; padding: 10px; margin-bottom: 8px; background: #2a2a2a; color: white; border: none; border-radius: 4px; cursor: pointer; text-align: left; }
+        .cam-btn:hover { background: #3a3a3a; }
+        .main-view { flex-grow: 1; background: #1e1e1e; padding: 15px; border-radius: 8px; text-align: center; }
+        img { max-width: 100%; height: auto; border-radius: 4px; background: #000; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h2>Cameras</h2>
+        {% for name in cameras %}
+            <button class="cam-btn" onclick="selectCamera('{{ name }}')">{{ name }}</button>
+        {% endfor %}
+    </div>
+    <div class="main-view">
+        <h2 id="cam-title">Select a camera</h2>
+        <img id="feed" src="" width="640" height="480" style="display:none;" />
+    </div>
+
+    <script>
+        function selectCamera(name) {
+            document.getElementById('cam-title').innerText = name;
+            const img = document.getElementById('feed');
+            img.src = "/video_feed/" + name;
+            img.style.display = "inline-block";
+        }
+    </script>
+</body>
+</html>
+"""
+
+def generate_mjpeg_stream(camera_name):
+    """Yields JPEG-encoded camera frames as a multipart MJPEG stream."""
+    while True:
+        with registry_lock:
+            entry = registry.get(camera_name)
+            frame = entry["latest"] if entry else None
+
+        if frame is not None:
+            # Encode frame to JPEG
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+        # Rate-limit to ~15 FPS to conserve Pi 3 CPU during multiple viewer connections
+        time.sleep(1.0 / 15)
+
+@web_app.route('/')
+def index():
+    with registry_lock:
+        cam_names = list(registry.keys())
+    return render_template_string(HTML_PAGE, cameras=cam_names)
+
+@web_app.route('/video_feed/<camera_name>')
+def video_feed(camera_name):
+    return Response(generate_mjpeg_stream(camera_name),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def run_web_server():
+    # Listens on all interfaces on port 5000
+    web_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 
 # ---------- frame sources ----------
@@ -1074,6 +1148,7 @@ def main():
         start_camera(cam["name"], cam["type"], cam["source"], registry, record_enabled, recording_mode)
 
     root = tk.Tk()
+    root.attributes('-fullscreen', True)
     root.title("Security Cameras — Pi 3 baseline")
 
     notebook = ttk.Notebook(root)
@@ -1152,6 +1227,9 @@ def main():
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     update_frame()
+    # Inside main() before root.mainloop()
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
     root.mainloop()
 
 
