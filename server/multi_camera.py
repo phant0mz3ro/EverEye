@@ -1175,6 +1175,24 @@ def main():
     video_label.pack(fill="both", expand=True)
     photo_holder = {"image": None}
     canvas_cache = {"canvas": None, "shape": None}
+    zoomed_cam = {"name": None}
+    grid_layout = {"cols": 1, "names": []}  # so clicks can map back to a camera
+
+    def on_video_click(event):
+        if zoomed_cam["name"] is not None:
+            zoomed_cam["name"] = None  # click while zoomed = go back to grid
+            return
+        cols = grid_layout["cols"]
+        names = grid_layout["names"]
+        if not names:
+            return
+        col = event.x // THUMB_W
+        row = event.y // THUMB_H
+        idx = row * cols + col
+        if 0 <= idx < len(names):
+            zoomed_cam["name"] = names[idx]
+
+    video_label.bind("<Button-1>", on_video_click)
 
     def update_frame():
         with registry_lock:
@@ -1182,6 +1200,8 @@ def main():
         n = len(names)
         cols = max(1, math.ceil(math.sqrt(n))) if n else 1
         rows = max(1, math.ceil(n / cols)) if n else 1
+        grid_layout["cols"] = cols
+        grid_layout["names"] = names
 
         for cam_name in names:
             try:
@@ -1192,26 +1212,43 @@ def main():
             except queue_module.Empty:
                 pass
 
-        shape = (rows * THUMB_H, cols * THUMB_W, 3)
-        if canvas_cache["canvas"] is None or canvas_cache["shape"] != shape:
-            canvas_cache["canvas"] = np.zeros(shape, dtype=np.uint8)
-            canvas_cache["shape"] = shape
-        canvas = canvas_cache["canvas"]
-
-        if n == 0:
-            cv2.putText(canvas, "No cameras — edit INITIAL_CAMERAS in multi_camera.py",
-                        (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-        for idx, cam_name in enumerate(names):
-            row, col = divmod(idx, cols)
-            y0, x0 = row * THUMB_H, col * THUMB_W
+        if zoomed_cam["name"] is not None and zoomed_cam["name"] in registry:
             with registry_lock:
-                data = registry[cam_name]["latest"]
+                data = registry[zoomed_cam["name"]]["latest"]
             if data is not None:
-                canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data
+                disp_w = video_label.winfo_width()
+                disp_h = video_label.winfo_height()
+                if disp_w > 1 and disp_h > 1:
+                    canvas = cv2.resize(data, (disp_w, disp_h))
+                else:
+                    canvas = data
             else:
-                cv2.putText(canvas, f"{cam_name}: connecting...",
-                            (x0 + 20, y0 + THUMB_H // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                canvas = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
+                cv2.putText(canvas, f"{zoomed_cam['name']}: connecting...",
+                            (20, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        else:
+            shape = (rows * THUMB_H, cols * THUMB_W, 3)
+            if canvas_cache["canvas"] is None or canvas_cache["shape"] != shape:
+                canvas_cache["canvas"] = np.zeros(shape, dtype=np.uint8)
+                canvas_cache["shape"] = shape
+            canvas = canvas_cache["canvas"]
+            grid_layout["canvas_w"] = cols * THUMB_W
+            grid_layout["canvas_h"] = rows * THUMB_H
+
+            if n == 0:
+                cv2.putText(canvas, "No cameras — edit INITIAL_CAMERAS in multi_camera.py",
+                            (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            for idx, cam_name in enumerate(names):
+                row, col = divmod(idx, cols)
+                y0, x0 = row * THUMB_H, col * THUMB_W
+                with registry_lock:
+                    data = registry[cam_name]["latest"]
+                if data is not None:
+                    canvas[y0:y0 + THUMB_H, x0:x0 + THUMB_W] = data
+                else:
+                    cv2.putText(canvas, f"{cam_name}: connecting...",
+                                (x0 + 20, y0 + THUMB_H // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
         rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
