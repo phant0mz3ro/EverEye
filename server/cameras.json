@@ -1,0 +1,22 @@
+[
+  {
+    "name": "usb0",
+    "type": "usb",
+    "source": 0
+  },
+  {
+    "name": "usb3",
+    "type": "usb",
+    "source": 3
+  },
+  {
+    "name": "usb1",
+    "type": "usb",
+    "source": 1
+  },
+  {
+    "name": "usb2",
+    "type": "usb",
+    "source": 2
+  }
+]

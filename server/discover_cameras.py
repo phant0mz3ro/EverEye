@@ -87,6 +87,30 @@ def _probe_host(ip):
     return None
 
 
+def discover_usb_cameras(max_index=10):
+    """
+    Probe local USB/webcam device indices (/dev/videoN on Linux, or a
+    plain index on Windows/Mac) for anything OpenCV can actually open
+    AND read a frame from. Separate from the network scan above — no
+    HTTP/RTSP involved, just local capture devices. cv2 is imported
+    lazily here so the network-only path above stays free of the
+    OpenCV dependency.
+    """
+    import cv2
+
+    found = []
+    for index in range(max_index):
+        cap = cv2.VideoCapture(index)
+        try:
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    found.append({"index": index, "protocol": "usb"})
+        finally:
+            cap.release()
+    return found
+
+
 def discover_cameras(max_workers=50):
     """
     Probe every host on the local /24 subnet in parallel, looking for
@@ -113,3 +137,10 @@ if __name__ == "__main__":
         print("No cameras found on the local network.")
     for cam in cameras:
         print(f"  {cam['protocol']} camera at {cam['ip']}:{cam['port']}{cam['stream_path'] or ''}")
+
+    print("Scanning local USB devices...")
+    usb_cameras = discover_usb_cameras()
+    if not usb_cameras:
+        print("No USB cameras found.")
+    for cam in usb_cameras:
+        print(f"  usb camera at device index {cam['index']}")
