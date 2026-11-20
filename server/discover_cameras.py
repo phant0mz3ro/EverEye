@@ -94,20 +94,26 @@ def discover_usb_cameras(max_index=10):
     AND read a frame from. Separate from the network scan above — no
     HTTP/RTSP involved, just local capture devices. cv2 is imported
     lazily here so the network-only path above stays free of the
-    OpenCV dependency.
+    OpenCV dependency. Each index is isolated in its own try/except so
+    one misbehaving device (a driver-level error, a device that hangs
+    on open) doesn't abort the scan of the remaining indices.
     """
     import cv2
 
     found = []
     for index in range(max_index):
-        cap = cv2.VideoCapture(index)
+        cap = None
         try:
+            cap = cv2.VideoCapture(index)
             if cap.isOpened():
                 ret, _ = cap.read()
                 if ret:
                     found.append({"index": index, "protocol": "usb"})
+        except Exception as e:
+            print(f"USB scan: device index {index} raised {e} — skipping")
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
     return found
 
 
@@ -115,16 +121,28 @@ def discover_cameras(max_workers=50):
     """
     Probe every host on the local /24 subnet in parallel, looking for
     anything serving MJPEG or RTSP. Takes a few seconds depending on
-    subnet size and network responsiveness.
+    subnet size and network responsiveness. Returns [] (rather than
+    raising) if the local subnet can't even be determined — e.g. no
+    network connection at all — so a caller doing both network and USB
+    discovery still gets USB results instead of losing the whole scan.
     """
-    network = _get_local_subnet()
+    try:
+        network = _get_local_subnet()
+    except OSError as e:
+        print(f"Network scan: couldn't determine local subnet ({e}) — skipping network discovery")
+        return []
     candidates = [str(ip) for ip in network.hosts()]
 
     found = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_probe_host, ip): ip for ip in candidates}
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+            ip = futures[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"Network scan: probing {ip} raised {e} — skipping")
+                continue
             if result:
                 found.append(result)
     return found

@@ -1021,21 +1021,41 @@ def build_manage_tab(parent, registry_, known_encodings_, known_ids_, profiles_,
         found_cameras["results"] = []
 
         def worker():
-            results = discover_cameras() + discover_usb_cameras()
+            network_results, usb_results, errors = [], [], []
+
+            try:
+                network_results = discover_cameras()
+            except Exception as e:
+                errors.append(f"network scan failed: {e}")
+                print(f"[Scan] Network discovery error: {e}")
+
+            try:
+                usb_results = discover_usb_cameras()
+            except Exception as e:
+                errors.append(f"USB scan failed: {e}")
+                print(f"[Scan] USB discovery error: {e}")
+
+            results = network_results + usb_results
 
             def update_ui():
                 discovery_listbox.delete(0, "end")
                 found_cameras["results"] = results
-                if not results:
+                for cam in results:
+                    if cam["protocol"] == "usb":
+                        label = f"USB  device index {cam['index']}"
+                    else:
+                        label = f"{cam['protocol'].upper()}  {cam['ip']}:{cam['port']}{cam['stream_path'] or ''}"
+                    discovery_listbox.insert("end", label)
+
+                if errors:
+                    status = "; ".join(errors)
+                    if results:
+                        status += f" — found {len(results)} camera(s) from the part that worked."
+                    scan_status_label.config(text=status)
+                elif not results:
                     scan_status_label.config(text="No cameras found (network or USB).")
                 else:
                     scan_status_label.config(text=f"Found {len(results)} camera(s). Select one, then click 'Use Selected'.")
-                    for cam in results:
-                        if cam["protocol"] == "usb":
-                            label = f"USB  device index {cam['index']}"
-                        else:
-                            label = f"{cam['protocol'].upper()}  {cam['ip']}:{cam['port']}{cam['stream_path'] or ''}"
-                        discovery_listbox.insert("end", label)
                 scan_btn.config(state="normal", text="Scan for Cameras")
 
             parent.after(0, update_ui)

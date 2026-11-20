@@ -1,13 +1,8 @@
 [
   {
-    "name": "usb0",
+    "name": "usb2",
     "type": "usb",
-    "source": 0
-  },
-  {
-    "name": "usb3",
-    "type": "usb",
-    "source": 3
+    "source": 2
   },
   {
     "name": "usb1",
@@ -15,8 +10,23 @@
     "source": 1
   },
   {
-    "name": "usb2",
+    "name": "usb0",
     "type": "usb",
-    "source": 2
+    "source": 0
+  },
+  {
+    "name": "phone",
+    "type": "http",
+    "source": "http://10.104.186.220:8080/video"
+  },
+  {
+    "name": "esp",
+    "type": "http",
+    "source": "http://10.104.186.104:81/stream"
+  },
+  {
+    "name": "espcam",
+    "type": "http",
+    "source": "http://192.168.0.104:81/stream"
   }
 ]
