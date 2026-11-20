@@ -28,5 +28,10 @@
     "name": "espcam",
     "type": "http",
     "source": "http://192.168.0.104:81/stream"
+  },
+  {
+    "name": "my1",
+    "type": "usb",
+    "source": 2
   }
 ]

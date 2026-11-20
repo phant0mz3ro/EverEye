@@ -2,5 +2,5 @@
   "recording_mode": "continuous",
   "recording_enabled": true,
   "recording_segment_sec": 180,
-  "face_recognition_enabled": false
+  "face_recognition_enabled": true
 }
